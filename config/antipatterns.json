@@ -1,0 +1,120 @@
+{
+  "version": "v1",
+  "_comment": "Stale idea attractors. Seeded from failure modes documented in the track's Findings tab; extend this as you review. A hit is a flag for the human reviewer, not an auto-reject.",
+  "patterns": [
+    {
+      "code": "constrain-memory",
+      "note": "Named in the track doc as a recurring attractor models fall into regardless of seed.",
+      "any": [
+        "memory limit",
+        "memory budget",
+        "constrain memory",
+        "limited memory",
+        "memory-constrained",
+        "fit in ram",
+        "bounded memory"
+      ]
+    },
+    {
+      "code": "token-limit",
+      "note": "Named in the track doc alongside constrain-memory.",
+      "any": [
+        "token limit",
+        "token budget",
+        "under a token",
+        "context window limit",
+        "limited context window"
+      ]
+    },
+    {
+      "code": "latency-throughput-only",
+      "note": "Vikas asked for simple rewards like throughput, but throughput-only tasks collapse into micro-optimisation with no reasoning.",
+      "any": [
+        "optimize latency",
+        "reduce latency",
+        "maximize throughput",
+        "improve throughput",
+        "speed up the",
+        "make it faster"
+      ]
+    },
+    {
+      "code": "synthetic-data",
+      "note": "Aug 25 guidance: use real-world data, avoid synthetic. Adhi flagged a bad task specifically for synthesising its own data.",
+      "any": [
+        "synthetic dataset",
+        "synthesize a dataset",
+        "generate synthetic data",
+        "randomly generated data",
+        "toy dataset",
+        "mock dataset"
+      ]
+    },
+    {
+      "code": "threshold-handed-over",
+      "note": "Valentina: handing the agent the objective function, its inputs, or the test thresholds turns the task into trivial optimisation.",
+      "any": [
+        "must achieve at least",
+        "score above",
+        "threshold of",
+        "exceed a score of",
+        "achieve an f1 of",
+        "accuracy of at least"
+      ]
+    },
+    {
+      "code": "leaks-eval-mechanics",
+      "note": "Vikas: revealing how the evaluation runs induces reward hacking.",
+      "any": [
+        "the test will",
+        "the grader",
+        "the verifier checks",
+        "evaluation harness",
+        "hidden test",
+        "the tests check"
+      ]
+    },
+    {
+      "code": "external-link",
+      "note": "Vikas: no paper/GitHub links in the task. If the agent needs the paper, mount it in the env.",
+      "regex": [
+        "https?://",
+        "\\barxiv\\.org\\b",
+        "\\bgithub\\.com\\b"
+      ]
+    },
+    {
+      "code": "reimplement-paper",
+      "note": "Hassan: reimplementing the paper produced his worst tasks; breaking an assumption produced his best.",
+      "any": [
+        "reproduce the paper",
+        "reimplement the paper",
+        "replicate the results",
+        "implement the algorithm described",
+        "implement the method from the paper"
+      ]
+    },
+    {
+      "code": "continuous-reward",
+      "note": "Hassan: Smoldata currently rejects continuous rewards. Track guidance is binary pass/fail.",
+      "any": [
+        "partial credit",
+        "continuous reward",
+        "graded score between",
+        "weighted score across",
+        "scoring formula"
+      ]
+    },
+    {
+      "code": "generic-crud",
+      "note": "Low-signal filler that passes validation without being interesting.",
+      "any": [
+        "rest api endpoint",
+        "crud application",
+        "todo app",
+        "web scraper",
+        "command line calculator"
+      ]
+    }
+  ]
+}
