@@ -2,11 +2,13 @@
 
 Ideation pipeline for the AAI **Research Papers to Tasks** track.
 
-Research paper → candidate task ideas → deduped → rubric-scored → human-adjudicated,
-with every idea and every rejection kept so the pipeline can be measured and tuned.
+Research paper or graph-discovery bundle → candidate task ideas → deduped →
+rubric-scored → human-adjudicated → task contract → isolated scaffold workspace →
+verification/review → submission triage → learning loop.
 
-It stops at *"here is an idea worth scaffolding."* Scaffolding, tests, and Smoldata
-submission stay manual.
+The first half keeps every idea and every rejection so the pipeline can be measured and
+tuned. The second half keeps every scaffold, verifier result, reviewer verdict, and
+submission outcome so task construction improves from evidence instead of memory.
 
 ## Why ideation
 
@@ -36,7 +38,7 @@ cd ~/AAI/ananyajain-ideation
 uv tool install --editable .     # or: alias ideation='python3 -m ideation.cli'
 ```
 
-## Flow
+## Ideation Flow
 
 ```bash
 # 1. find and ingest a seed
@@ -68,12 +70,72 @@ ideation report
 ideation outcome 42 --smoldata-task-id abc-123 --accepted 1 --pass-rate 0.13
 ```
 
+## Task-Generation Flow
+
+The graph-guided discovery engine fits upstream of this repo. It should emit a bundle of
+Markdown/JSON evidence describing a vetted research direction; this harness ingests that
+bundle and moves accepted ideas through controlled construction.
+
+```bash
+# 1. ingest a discovery bundle from Paper Factory or another graph-discovery run
+ideation discovery ingest /path/to/discovery-bundle \
+  --source paper-task-factory \
+  --source-url https://fb.workplace.com/groups/3258720224333062/posts/3291314974406920 \
+  --title "graph-guided harness discovery"
+
+# 2. draft a task contract from a human-accepted idea
+ideation contract create 42 \
+  --bundle-id 1 \
+  --hidden-principle "hidden semantic oracle over held-out cases" \
+  --allowed-input "visible fixtures and public README" \
+  --forbidden-leak "hidden cases, scoring thresholds, oracle implementation" \
+  --oracle-strategy "compare against implementation-independent hidden oracle" \
+  --mutation-strategy "reject noop, hard-coded, and public-example-only solvers" \
+  --infra-requirement "stdlib Python verifier inside the task image" \
+  --difficulty-target "frontier agents should need multiple attempts"
+
+# 3. mark complete contracts ready
+ideation contract ready 1
+
+# 4. create an isolated scaffold workspace
+ideation scaffold start 1 --builder codex
+
+# 5. run the builder with a human-owned prompt template, or build manually under task/
+ideation scaffold run 1 --prompt-file /path/to/build_prompt.md
+
+# 6. after the builder creates task files under the workspace's task/ directory,
+# run local checks and record adversarial reviews
+ideation verify run 1 --cwd task -- python3 -m unittest discover -s tests -v
+ideation audit record 1 --reviewer tbh --kind adversarial --verdict revise \
+  --issue BAD_GRADING_WEAK:"hidden oracle misses edge cases"
+
+# 7. promote only approved staged files into an empty canonical task root
+ideation scaffold promote 1 /path/to/canonical-task-root
+
+# 8. record Smoldata/Codimango results and preserve the triage route
+ideation submission record 1 --platform smoldata --external-id abc-123 \
+  --status bad_grading_weak --pass-rate 1.0 --revisions 2
+
+# 9. write durable learning events for later A/B tests
+ideation learn add --scope-type submission --scope-id 1 \
+  --label weak-grader --detail "public cases did not cover stateful edge cases"
+
+# 10. see controller state and queued next actions
+ideation pipeline status
+```
+
 ## Isolation
 
 Valentina's Codex-vs-TBH comparison was invalidated because the agents could read each
 other's tasks, and NG Li caught Muse writing outside its assigned workspace. So each run
 gets a fresh root under `runs/<seed>/<generator>/<timestamp>/` containing only the paper
 and the assumptions file, and `assert_isolated()` fails the run if anything else appears.
+
+Scaffold construction uses the same principle. `ideation scaffold start` creates a fresh
+workspace with `TASK_CONTRACT.json`, `TASK_CONTRACT.md`, controller notes, and empty
+`task/`, `logs/`, `reviews/`, and `verification/` directories. Builders work only inside
+that workspace. `ideation scaffold promote` is the only command that copies staged task
+files into a canonical output directory.
 
 Any per-generator number in `ideation report` is only trustworthy because of this.
 

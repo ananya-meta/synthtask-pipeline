@@ -5,11 +5,15 @@ Run: python3 -m unittest discover -s tests -v
 
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from ideation import db, dedup, generate, report
+from ideation import db, dedup, generate, lifecycle, report
 
 
 def make_corpus(conn):
@@ -237,6 +241,197 @@ class TestIdeaParsing(unittest.TestCase):
             root = Path(tmp)
             (root / "last_message.txt").write_text("I was unable to complete this task.")
             self.assertEqual(generate._parse_ideas(root), [])
+
+
+class TestLifecycle(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conn = db.connect(Path(self.tmp.name) / "t.db")
+        self.seed_id, self.runs = make_corpus(self.conn)
+        self.idea_id = db.add_idea(
+            self.conn,
+            self.runs["codex"],
+            self.seed_id,
+            {
+                "title": "rank unstable citation bridges",
+                "statement": "Find citation bridges whose concept support changes under drift.",
+                "assumption_broken": "the literature graph is stationary",
+                "difficulty_claim": "requires hidden graph cases",
+                "dataset_ref": "OpenAlex concept graph",
+            },
+        )
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def test_contract_requires_accepted_idea_by_default(self):
+        with self.assertRaises(lifecycle.LifecycleError):
+            lifecycle.create_contract(self.conn, self.idea_id)
+
+        db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
+        contract_id = lifecycle.create_contract(self.conn, self.idea_id)
+        row = db.get_task_contract(self.conn, contract_id)
+        self.assertEqual(row["objective"], "Find citation bridges whose concept support changes under drift.")
+        self.assertEqual(row["status"], "draft")
+
+    def test_contract_ready_requires_complete_fields(self):
+        db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
+        contract_id = lifecycle.create_contract(
+            self.conn,
+            self.idea_id,
+            hidden_principle="Score concept transfer without exposing held-out bridges.",
+            allowed_inputs='["paper graph snapshot"]',
+            forbidden_leaks='["held-out bridge list", "scoring thresholds"]',
+            oracle_strategy="Compare submitted bridge rankings to hidden semantic oracle.",
+            mutation_strategy="Reject solvers that hard-code public examples or ignore edge weights.",
+            infra_requirements="Runs in the task Docker image with stdlib Python.",
+            difficulty_target="Frontier agents should need graph reasoning and fail simple heuristics.",
+        )
+        self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
+        self.assertEqual(db.get_task_contract(self.conn, contract_id)["status"], "ready")
+
+    def test_discovery_ingest_captures_text_bundle(self):
+        bundle = Path(self.tmp.name) / "bundle"
+        bundle.mkdir()
+        (bundle / "direction.md").write_text("# Direction\nMine citation bridges.\n")
+        (bundle / "evidence.json").write_text('{"papers": 3}\n')
+
+        bundle_id = lifecycle.ingest_discovery_bundle(
+            self.conn,
+            bundle,
+            seed_ref="00-test-seed",
+            source="paper-task-factory",
+            title="Citation bridge bundle",
+        )
+        row = db.list_discovery_bundles(self.conn)[0]
+        payload = json.loads(row["payload_json"])
+        self.assertEqual(bundle_id, row["id"])
+        self.assertEqual(row["seed_id"], self.seed_id)
+        self.assertEqual({f["path"] for f in payload["files"]}, {"direction.md", "evidence.json"})
+
+    def test_scaffold_workspace_isolated_and_verifiable(self):
+        db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
+        contract_id = lifecycle.create_contract(
+            self.conn,
+            self.idea_id,
+            hidden_principle="Hidden graph cases.",
+            allowed_inputs='["visible graph"]',
+            forbidden_leaks='["hidden graph"]',
+            oracle_strategy="Compare against hidden graph oracle.",
+            mutation_strategy="Reject constant outputs.",
+            infra_requirements="stdlib Python.",
+            difficulty_target="Not solved by a noop.",
+        )
+        with self.assertRaises(lifecycle.LifecycleError):
+            lifecycle.start_scaffold(self.conn, contract_id, builder="codex")
+        self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
+        scaffold_id, root = lifecycle.start_scaffold(self.conn, contract_id, builder="codex")
+        lifecycle.assert_scaffold_isolated(root)
+        self.assertTrue((root / "TASK_CONTRACT.json").exists())
+        self.assertTrue((root / "task").is_dir())
+
+        (root / "unexpected.txt").write_text("leak")
+        with self.assertRaises(lifecycle.LifecycleError):
+            lifecycle.assert_scaffold_isolated(root)
+
+        (root / "unexpected.txt").unlink()
+        verify_id = lifecycle.run_verification(
+            self.conn,
+            scaffold_id,
+            [sys.executable, "-c", "print('ok')"],
+            timeout=30,
+        )
+        status = self.conn.execute(
+            "SELECT status FROM verification_runs WHERE id = ?", (verify_id,)
+        ).fetchone()["status"]
+        self.assertEqual(status, "pass")
+
+    def test_scaffold_worker_renders_prompt_and_updates_state(self):
+        db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
+        contract_id = lifecycle.create_contract(
+            self.conn,
+            self.idea_id,
+            hidden_principle="Hidden graph cases.",
+            allowed_inputs='["visible graph"]',
+            forbidden_leaks='["hidden graph"]',
+            oracle_strategy="Compare against hidden graph oracle.",
+            mutation_strategy="Reject constant outputs.",
+            infra_requirements="stdlib Python.",
+            difficulty_target="Not solved by a noop.",
+        )
+        self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
+        scaffold_id, root = lifecycle.start_scaffold(self.conn, contract_id, builder="codex")
+        prompt_file = Path(self.tmp.name) / "build_prompt.md"
+        prompt_file.write_text("Use {{TASK_DIR}}\n\n{{TASK_CONTRACT_JSON}}\n")
+
+        completed = subprocess.CompletedProcess(["codex"], 0, stdout="built", stderr="")
+        with mock.patch.object(lifecycle.subprocess, "run", return_value=completed) as run:
+            rc = lifecycle.run_scaffold_worker(self.conn, scaffold_id, prompt_file, timeout=30)
+
+        self.assertEqual(rc, 0)
+        rendered = (root / "RUN_PROMPT.md").read_text()
+        self.assertIn(str(root / "task"), rendered)
+        self.assertIn('"idea_id":', rendered)
+        self.assertEqual(run.call_args.kwargs["cwd"], root)
+        scaffold = db.get_scaffold_run(self.conn, scaffold_id)
+        self.assertEqual(scaffold["state"], "built")
+        self.assertEqual(scaffold["exit_code"], 0)
+
+    def test_submission_updates_outcome_and_triage(self):
+        db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
+        contract_id = lifecycle.create_contract(
+            self.conn,
+            self.idea_id,
+            hidden_principle="Hidden graph cases.",
+            allowed_inputs='["visible graph"]',
+            forbidden_leaks='["hidden graph"]',
+            oracle_strategy="Compare against hidden graph oracle.",
+            mutation_strategy="Reject constant outputs.",
+            infra_requirements="stdlib Python.",
+            difficulty_target="Not solved by a noop.",
+        )
+        self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
+        scaffold_id, _ = lifecycle.start_scaffold(self.conn, contract_id)
+        submission_id = lifecycle.record_submission(
+            self.conn,
+            scaffold_id,
+            platform="smoldata",
+            external_id="task-123",
+            status="bad_grading_weak",
+            pass_rate=1.0,
+            revisions=2,
+            result={"label": "BAD_GRADING_WEAK"},
+        )
+        self.assertEqual(lifecycle.triage_route("bad_grading_weak"), "strengthen_oracle")
+        self.assertGreater(submission_id, 0)
+        outcome = self.conn.execute(
+            "SELECT * FROM outcomes WHERE idea_id = ?", (self.idea_id,)
+        ).fetchone()
+        self.assertEqual(outcome["accepted"], 0)
+        self.assertEqual(outcome["smoldata_task_id"], "task-123")
+
+    def test_next_actions_advance_from_accepted_idea_to_scaffold(self):
+        db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
+        first = lifecycle.next_actions(self.conn)
+        self.assertEqual(first[0]["stage"], "contract")
+        self.assertIn(str(self.idea_id), first[0]["action"])
+
+        contract_id = lifecycle.create_contract(
+            self.conn,
+            self.idea_id,
+            hidden_principle="Hidden graph cases.",
+            allowed_inputs='["visible graph"]',
+            forbidden_leaks='["hidden graph"]',
+            oracle_strategy="Compare against hidden graph oracle.",
+            mutation_strategy="Reject constant outputs.",
+            infra_requirements="stdlib Python.",
+            difficulty_target="Not solved by a noop.",
+        )
+        self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
+        second = lifecycle.next_actions(self.conn)
+        self.assertEqual(second[0]["stage"], "scaffold")
+        self.assertIn(str(contract_id), second[0]["action"])
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from collections import Counter, defaultdict
 
-from . import db, dedup, judge
+from . import db, dedup, judge, lifecycle
 
 BAR = "█"
 
@@ -299,6 +299,25 @@ def render(conn) -> str:
         f" → {dn['task_accepted']} accepted tasks"
         + (f"   (conversion {dn['conversion']:.0%})" if dn["conversion"] is not None else "")
     )
+
+    pl = lifecycle.pipeline_summary(conn)
+    lines += ["", "TASK-GENERATION PIPELINE", "─" * 62]
+    lines.append(
+        f"  bundles {pl['discovery_bundles']}   contracts {pl['contracts']}"
+        f"   ready {pl['ready_contracts']}   scaffolds {pl['scaffold_runs']}"
+    )
+    lines.append(
+        f"  verifications {pl['verification_runs']}"
+        f"   passing {pl['passing_verifications']}   reviews {pl['reviews']}"
+        f"   submissions {pl['submissions']}   learnings {pl['learning_events']}"
+    )
+    for item in pl["latest_submissions"]:
+        ident = item["external_id"] or f"submission #{item['id']}"
+        rate = "" if item["pass_rate"] is None else f" pass_rate={item['pass_rate']}"
+        lines.append(
+            f"    {item['platform']} {ident}: {item['status']}"
+            f" -> {item['route']}{rate}"
+        )
     lines.append("")
     return "\n".join(lines)
 
@@ -313,6 +332,7 @@ def as_json(conn) -> str:
             "reason_histogram": reason_histogram(conn),
             "agreement": agreement(conn),
             "downstream": downstream(conn),
+            "pipeline": lifecycle.pipeline_summary(conn),
         },
         indent=2,
     )

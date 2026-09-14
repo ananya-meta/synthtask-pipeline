@@ -101,9 +101,106 @@ CREATE TABLE IF NOT EXISTS outcomes (
     note             TEXT
 );
 
+CREATE TABLE IF NOT EXISTS discovery_bundles (
+    id           INTEGER PRIMARY KEY,
+    seed_id      INTEGER REFERENCES seeds(id),
+    bundle_key   TEXT UNIQUE NOT NULL,
+    title        TEXT NOT NULL,
+    source       TEXT NOT NULL,
+    source_url   TEXT,
+    path         TEXT,
+    payload_json TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'new',
+    added_at     REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_contracts (
+    id                 INTEGER PRIMARY KEY,
+    idea_id            INTEGER NOT NULL REFERENCES ideas(id),
+    discovery_bundle_id INTEGER REFERENCES discovery_bundles(id),
+    version            INTEGER NOT NULL DEFAULT 1,
+    status             TEXT NOT NULL DEFAULT 'draft',
+    objective          TEXT NOT NULL,
+    hidden_principle   TEXT NOT NULL,
+    allowed_inputs     TEXT NOT NULL,
+    forbidden_leaks    TEXT NOT NULL,
+    oracle_strategy    TEXT NOT NULL,
+    mutation_strategy  TEXT NOT NULL,
+    infra_requirements TEXT NOT NULL,
+    difficulty_target  TEXT NOT NULL,
+    contract_json      TEXT NOT NULL,
+    created_at         REAL NOT NULL,
+    updated_at         REAL NOT NULL,
+    UNIQUE (idea_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS scaffold_runs (
+    id             INTEGER PRIMARY KEY,
+    contract_id    INTEGER NOT NULL REFERENCES task_contracts(id),
+    builder        TEXT NOT NULL,
+    model          TEXT,
+    revision       INTEGER NOT NULL DEFAULT 1,
+    workspace_root TEXT NOT NULL,
+    canonical_root TEXT,
+    state          TEXT NOT NULL DEFAULT 'started',
+    started_at     REAL NOT NULL,
+    finished_at    REAL,
+    exit_code      INTEGER,
+    stderr_tail    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS verification_runs (
+    id              INTEGER PRIMARY KEY,
+    scaffold_run_id INTEGER NOT NULL REFERENCES scaffold_runs(id),
+    verifier        TEXT NOT NULL,
+    command         TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    stdout_tail     TEXT,
+    stderr_tail     TEXT,
+    started_at      REAL NOT NULL,
+    finished_at     REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS review_records (
+    id              INTEGER PRIMARY KEY,
+    scaffold_run_id INTEGER NOT NULL REFERENCES scaffold_runs(id),
+    reviewer        TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    verdict         TEXT NOT NULL,
+    issues_json     TEXT NOT NULL,
+    note            TEXT,
+    created_at      REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS submissions (
+    id              INTEGER PRIMARY KEY,
+    scaffold_run_id INTEGER NOT NULL REFERENCES scaffold_runs(id),
+    platform        TEXT NOT NULL,
+    external_id     TEXT,
+    status          TEXT NOT NULL,
+    pass_rate       REAL,
+    revisions       INTEGER,
+    result_json     TEXT NOT NULL,
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS learning_events (
+    id           INTEGER PRIMARY KEY,
+    scope_type   TEXT NOT NULL,
+    scope_id     INTEGER NOT NULL,
+    label        TEXT NOT NULL,
+    detail       TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at   REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_ideas_seed ON ideas(seed_id);
 CREATE INDEX IF NOT EXISTS idx_ideas_run  ON ideas(run_id);
 CREATE INDEX IF NOT EXISTS idx_runs_seed  ON runs(seed_id);
+CREATE INDEX IF NOT EXISTS idx_contracts_idea ON task_contracts(idea_id);
+CREATE INDEX IF NOT EXISTS idx_scaffolds_contract ON scaffold_runs(contract_id);
+CREATE INDEX IF NOT EXISTS idx_submissions_scaffold ON submissions(scaffold_run_id);
 """
 
 
@@ -308,3 +405,183 @@ def set_outcome(conn: sqlite3.Connection, idea_id: int, **kw: Any) -> None:
 
 def rows_to_dicts(rows: Iterable[sqlite3.Row]) -> list[dict]:
     return [dict(r) for r in rows]
+
+
+# --- downstream lifecycle -------------------------------------------------
+
+
+def add_discovery_bundle(conn: sqlite3.Connection, **kw: Any) -> int:
+    kw.setdefault("added_at", time.time())
+    kw.setdefault("status", "new")
+    existing = conn.execute(
+        "SELECT id FROM discovery_bundles WHERE bundle_key = ?",
+        (kw["bundle_key"],),
+    ).fetchone()
+    if existing:
+        sets = ", ".join(f"{k} = ?" for k in kw if k != "bundle_key")
+        values = [v for k, v in kw.items() if k != "bundle_key"]
+        conn.execute(
+            f"UPDATE discovery_bundles SET {sets} WHERE bundle_key = ?",
+            (*values, kw["bundle_key"]),
+        )
+        conn.commit()
+        return existing["id"]
+
+    cols = ", ".join(kw)
+    marks = ", ".join("?" for _ in kw)
+    cur = conn.execute(
+        f"INSERT INTO discovery_bundles ({cols}) VALUES ({marks})",
+        tuple(kw.values()),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def list_discovery_bundles(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM discovery_bundles ORDER BY added_at DESC, id DESC"
+    ).fetchall()
+
+
+def get_idea(conn: sqlite3.Connection, idea_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM ideas WHERE id = ?", (idea_id,)).fetchone()
+
+
+def verdict_for(conn: sqlite3.Connection, idea_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM verdicts WHERE idea_id = ?", (idea_id,)
+    ).fetchone()
+
+
+def next_contract_version(conn: sqlite3.Connection, idea_id: int) -> int:
+    row = conn.execute(
+        "SELECT MAX(version) AS v FROM task_contracts WHERE idea_id = ?",
+        (idea_id,),
+    ).fetchone()
+    return int(row["v"] or 0) + 1
+
+
+def add_task_contract(conn: sqlite3.Connection, **kw: Any) -> int:
+    now = time.time()
+    kw.setdefault("created_at", now)
+    kw.setdefault("updated_at", now)
+    kw.setdefault("status", "draft")
+    kw.setdefault("version", next_contract_version(conn, int(kw["idea_id"])))
+    cols = ", ".join(kw)
+    marks = ", ".join("?" for _ in kw)
+    cur = conn.execute(
+        f"INSERT INTO task_contracts ({cols}) VALUES ({marks})",
+        tuple(kw.values()),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def update_task_contract_status(conn: sqlite3.Connection, contract_id: int, status: str) -> None:
+    conn.execute(
+        "UPDATE task_contracts SET status = ?, updated_at = ? WHERE id = ?",
+        (status, time.time(), contract_id),
+    )
+    conn.commit()
+
+
+def get_task_contract(conn: sqlite3.Connection, contract_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM task_contracts WHERE id = ?", (contract_id,)
+    ).fetchone()
+
+
+def list_task_contracts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT c.*, i.title AS idea_title FROM task_contracts c"
+        " JOIN ideas i ON i.id = c.idea_id"
+        " ORDER BY c.updated_at DESC, c.id DESC"
+    ).fetchall()
+
+
+def add_scaffold_run(conn: sqlite3.Connection, **kw: Any) -> int:
+    kw.setdefault("started_at", time.time())
+    kw.setdefault("state", "started")
+    kw.setdefault("revision", 1)
+    cols = ", ".join(kw)
+    marks = ", ".join("?" for _ in kw)
+    cur = conn.execute(
+        f"INSERT INTO scaffold_runs ({cols}) VALUES ({marks})", tuple(kw.values())
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def update_scaffold_run(conn: sqlite3.Connection, scaffold_run_id: int, **kw: Any) -> None:
+    if not kw:
+        return
+    sets = ", ".join(f"{k} = ?" for k in kw)
+    conn.execute(
+        f"UPDATE scaffold_runs SET {sets} WHERE id = ?",
+        (*kw.values(), scaffold_run_id),
+    )
+    conn.commit()
+
+
+def get_scaffold_run(conn: sqlite3.Connection, scaffold_run_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM scaffold_runs WHERE id = ?", (scaffold_run_id,)
+    ).fetchone()
+
+
+def list_scaffold_runs(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT s.*, c.idea_id, i.title AS idea_title FROM scaffold_runs s"
+        " JOIN task_contracts c ON c.id = s.contract_id"
+        " JOIN ideas i ON i.id = c.idea_id"
+        " ORDER BY s.started_at DESC, s.id DESC"
+    ).fetchall()
+
+
+def add_verification_run(conn: sqlite3.Connection, **kw: Any) -> int:
+    now = time.time()
+    kw.setdefault("started_at", now)
+    kw.setdefault("finished_at", now)
+    cols = ", ".join(kw)
+    marks = ", ".join("?" for _ in kw)
+    cur = conn.execute(
+        f"INSERT INTO verification_runs ({cols}) VALUES ({marks})",
+        tuple(kw.values()),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def add_review_record(conn: sqlite3.Connection, **kw: Any) -> int:
+    kw.setdefault("created_at", time.time())
+    cols = ", ".join(kw)
+    marks = ", ".join("?" for _ in kw)
+    cur = conn.execute(
+        f"INSERT INTO review_records ({cols}) VALUES ({marks})", tuple(kw.values())
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def add_submission(conn: sqlite3.Connection, **kw: Any) -> int:
+    now = time.time()
+    kw.setdefault("created_at", now)
+    kw.setdefault("updated_at", now)
+    cols = ", ".join(kw)
+    marks = ", ".join("?" for _ in kw)
+    cur = conn.execute(
+        f"INSERT INTO submissions ({cols}) VALUES ({marks})", tuple(kw.values())
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def add_learning_event(conn: sqlite3.Connection, **kw: Any) -> int:
+    kw.setdefault("created_at", time.time())
+    cols = ", ".join(kw)
+    marks = ", ".join("?" for _ in kw)
+    cur = conn.execute(
+        f"INSERT INTO learning_events ({cols}) VALUES ({marks})", tuple(kw.values())
+    )
+    conn.commit()
+    return cur.lastrowid
