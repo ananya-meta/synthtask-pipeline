@@ -1,4 +1,4 @@
-"""SQLite store for the ideation corpus.
+"""SQLite store for the synthetic task pipeline corpus.
 
 Every idea ever generated is kept, including rejected ones — the rejections carry the
 reason codes that train the judge, so they are the point rather than a byproduct.

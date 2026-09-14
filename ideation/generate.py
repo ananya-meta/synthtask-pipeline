@@ -68,7 +68,7 @@ def render_prompt(seed_dir: Path, n_ideas: int, template: Path | None = None) ->
     if tpl.strip().startswith("<!-- TODO"):
         raise GeneratorError(
             f"{tpl_path} is still the empty placeholder. Write the generation prompt "
-            f"before running `ideation generate`."
+            f"before running `synthtask generate`."
         )
 
     meta = json.loads((seed_dir / "meta.json").read_text())

@@ -1,6 +1,6 @@
-# ananyajain-ideation
+# synthtask-pipeline
 
-Ideation pipeline for the AAI **Research Papers to Tasks** track.
+Synthetic task generation pipeline for the AAI **Research Papers to Tasks** track.
 
 Research paper or graph-discovery bundle → candidate task ideas → deduped →
 rubric-scored → human-adjudicated → task contract → isolated scaffold workspace →
@@ -34,16 +34,16 @@ approve them too easily."*
 Stdlib only — no dependencies.
 
 ```bash
-cd ~/AAI/ananyajain-ideation
-uv tool install --editable .     # or: alias ideation='python3 -m ideation.cli'
+cd synthtask-pipeline
+uv tool install --editable .     # installs `synthtask`; `ideation` remains an alias
 ```
 
 ## Ideation Flow
 
 ```bash
 # 1. find and ingest a seed
-ideation seed search "llm as a judge rubric reliability" --sort-by citations
-ideation seed add --arxiv-id 2606.19544 --lane llm-eval
+synthtask seed search "llm as a judge rubric reliability" --sort-by citations
+synthtask seed add --arxiv-id 2606.19544 --lane llm-eval
 
 # 2. fill in the paper's load-bearing assumptions, by hand
 $EDITOR seeds/01-*/ASSUMPTIONS.md
@@ -52,22 +52,22 @@ $EDITOR seeds/01-*/ASSUMPTIONS.md
 $EDITOR prompts/generate_ideas.md      # see prompts/README.md
 
 # 4. generate under isolation — codex and tbh never see each other's output
-ideation generate 01-reliability-without-validity -n 8
+synthtask generate 01-reliability-without-validity -n 8
 
 # 5. prefilter, then escalate borderline pairs to Codex
-ideation dedup --adjudicate
+synthtask dedup --adjudicate
 
 # 6. score against your rubric (needs prompts/judge_rubric.md)
-ideation judge
+synthtask judge
 
 # 7. the human gate — single-keystroke reason codes, resumable
-ideation review
+synthtask review
 
 # 8. metrics
-ideation report
+synthtask report
 
 # 9. close the loop once a task reaches Smoldata
-ideation outcome 42 --smoldata-task-id abc-123 --accepted 1 --pass-rate 0.13
+synthtask outcome 42 --smoldata-task-id abc-123 --accepted 1 --pass-rate 0.13
 ```
 
 ## Task-Generation Flow
@@ -78,13 +78,13 @@ bundle and moves accepted ideas through controlled construction.
 
 ```bash
 # 1. ingest a discovery bundle from Paper Factory or another graph-discovery run
-ideation discovery ingest /path/to/discovery-bundle \
+synthtask discovery ingest /path/to/discovery-bundle \
   --source paper-task-factory \
   --source-url https://fb.workplace.com/groups/3258720224333062/posts/3291314974406920 \
   --title "graph-guided harness discovery"
 
 # 2. draft a task contract from a human-accepted idea
-ideation contract create 42 \
+synthtask contract create 42 \
   --bundle-id 1 \
   --hidden-principle "hidden semantic oracle over held-out cases" \
   --allowed-input "visible fixtures and public README" \
@@ -95,40 +95,40 @@ ideation contract create 42 \
   --difficulty-target "frontier agents should need multiple attempts"
 
 # 3. mark complete contracts ready
-ideation contract ready 1
+synthtask contract ready 1
 
 # 4. create an isolated scaffold workspace
-ideation scaffold start 1 --builder codex
+synthtask scaffold start 1 --builder codex
 
 # 5. run the builder with a human-owned prompt template, or build manually under task/
-ideation scaffold run 1 --prompt-file /path/to/build_prompt.md
+synthtask scaffold run 1 --prompt-file /path/to/build_prompt.md
 
 # 6. after the builder creates task files under the workspace's task/ directory,
 # run local checks and record adversarial reviews
-ideation verify run 1 --cwd task -- python3 -m unittest discover -s tests -v
-ideation audit record 1 --reviewer tbh --kind adversarial --verdict revise \
+synthtask verify run 1 --cwd task -- python3 -m unittest discover -s tests -v
+synthtask audit record 1 --reviewer tbh --kind adversarial --verdict revise \
   --issue BAD_GRADING_WEAK:"hidden oracle misses edge cases"
 
 # 7. promote only approved staged files into an empty canonical task root
-ideation scaffold promote 1 /path/to/canonical-task-root
+synthtask scaffold promote 1 /path/to/canonical-task-root
 
 # 8. record Smoldata/Codimango results and preserve the triage route
-ideation submission record 1 --platform smoldata --external-id abc-123 \
+synthtask submission record 1 --platform smoldata --external-id abc-123 \
   --status bad_grading_weak --pass-rate 1.0 --revisions 2
 
 # 9. write durable learning events for later A/B tests
-ideation learn add --scope-type submission --scope-id 1 \
+synthtask learn add --scope-type submission --scope-id 1 \
   --label weak-grader --detail "public cases did not cover stateful edge cases"
 
 # 10. see controller state and queued next actions
-ideation pipeline status
+synthtask pipeline status
 ```
 
-`ideation pipeline run` can advance one task through the same gates until it reaches a
+`synthtask pipeline run` can advance one task through the same gates until it reaches a
 real blocker:
 
 ```bash
-ideation pipeline run \
+synthtask pipeline run \
   --idea-id 42 \
   --bundle-id 1 \
   --builder codex \
@@ -160,9 +160,9 @@ So submission/upload remains an explicit external step, and this repo records th
 resulting task name or ID:
 
 ```bash
-ideation smoldata watch my-task-name --scaffold-run-id 1
-ideation smoldata review my-task-name --wait --scaffold-run-id 1
-ideation smoldata rerun my-task-name
+synthtask smoldata watch my-task-name --scaffold-run-id 1
+synthtask smoldata review my-task-name --wait --scaffold-run-id 1
+synthtask smoldata rerun my-task-name
 ```
 
 Smoldata feedback is mapped into controller routing:
@@ -186,13 +186,13 @@ other's tasks, and NG Li caught Muse writing outside its assigned workspace. So 
 gets a fresh root under `runs/<seed>/<generator>/<timestamp>/` containing only the paper
 and the assumptions file, and `assert_isolated()` fails the run if anything else appears.
 
-Scaffold construction uses the same principle. `ideation scaffold start` creates a fresh
+Scaffold construction uses the same principle. `synthtask scaffold start` creates a fresh
 workspace with `TASK_CONTRACT.json`, `TASK_CONTRACT.md`, controller notes, and empty
 `task/`, `logs/`, `reviews/`, and `verification/` directories. Builders work only inside
-that workspace. `ideation scaffold promote` is the only command that copies staged task
+that workspace. `synthtask scaffold promote` is the only command that copies staged task
 files into a canonical output directory.
 
-Any per-generator number in `ideation report` is only trustworthy because of this.
+Any per-generator number in `synthtask report` is only trustworthy because of this.
 
 ## Reason codes
 

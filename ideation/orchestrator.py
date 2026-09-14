@@ -100,7 +100,7 @@ def run(conn, config: PipelineRunConfig) -> PipelineRunResult:
                 **config.contract_overrides,
             )
         except lifecycle.LifecycleError as exc:
-            return _blocked(result, "contract", str(exc), f"ideation contract create {config.idea_id}")
+            return _blocked(result, "contract", str(exc), f"synthtask contract create {config.idea_id}")
         result.ids["contract_id"] = contract_id
         result.completed.append("contract")
 
@@ -112,13 +112,13 @@ def run(conn, config: PipelineRunConfig) -> PipelineRunResult:
         try:
             missing = lifecycle.mark_contract_ready(conn, contract_id)
         except lifecycle.LifecycleError as exc:
-            return _blocked(result, "ready", str(exc), f"ideation contract ready {contract_id}")
+            return _blocked(result, "ready", str(exc), f"synthtask contract ready {contract_id}")
         if missing:
             return _blocked(
                 result,
                 "ready",
                 f"contract is incomplete: {', '.join(missing)}",
-                f"fill contract #{contract_id}, then run `ideation contract ready {contract_id}`",
+                f"fill contract #{contract_id}, then run `synthtask contract ready {contract_id}`",
             )
         result.completed.append("ready")
 
@@ -133,7 +133,7 @@ def run(conn, config: PipelineRunConfig) -> PipelineRunResult:
                 allow_draft=config.allow_draft_scaffold,
             )
         except lifecycle.LifecycleError as exc:
-            return _blocked(result, "scaffold", str(exc), f"ideation scaffold start {contract_id}")
+            return _blocked(result, "scaffold", str(exc), f"synthtask scaffold start {contract_id}")
         result.ids["scaffold_run_id"] = scaffold_run_id
         result.ids["workspace_root"] = str(root)
         result.completed.append("scaffold")
@@ -152,7 +152,7 @@ def run(conn, config: PipelineRunConfig) -> PipelineRunResult:
                 result,
                 "build",
                 "builder prompt file is required for automated scaffold generation",
-                f"ideation scaffold run {scaffold_run_id} --prompt-file /path/to/build_prompt.md",
+                f"synthtask scaffold run {scaffold_run_id} --prompt-file /path/to/build_prompt.md",
             )
         else:
             try:
@@ -162,7 +162,7 @@ def run(conn, config: PipelineRunConfig) -> PipelineRunResult:
                     config.build_prompt_file,
                 )
             except lifecycle.LifecycleError as exc:
-                return _blocked(result, "build", str(exc), f"ideation scaffold run {scaffold_run_id}")
+                return _blocked(result, "build", str(exc), f"synthtask scaffold run {scaffold_run_id}")
             if rc != 0:
                 return _blocked(result, "build", f"builder exited {rc}", "inspect worker_stderr.log")
             result.completed.append("build")
@@ -179,7 +179,7 @@ def run(conn, config: PipelineRunConfig) -> PipelineRunResult:
                 result,
                 "verify",
                 "at least one local verifier command is required",
-                f"ideation verify run {scaffold_run_id} --cwd task -- <command>",
+                f"synthtask verify run {scaffold_run_id} --cwd task -- <command>",
             )
         else:
             for command in config.verify_commands:
@@ -202,7 +202,7 @@ def run(conn, config: PipelineRunConfig) -> PipelineRunResult:
                 result,
                 "audit",
                 "no approving adversarial review is recorded",
-                f"ideation audit record {scaffold_run_id} --reviewer <name> --verdict approve",
+                f"synthtask audit record {scaffold_run_id} --reviewer <name> --verdict approve",
             )
         result.completed.append("audit")
 
@@ -217,13 +217,13 @@ def run(conn, config: PipelineRunConfig) -> PipelineRunResult:
                 result,
                 "promote",
                 "canonical output directory is required",
-                f"ideation scaffold promote {scaffold_run_id} /path/to/canonical-task-root",
+                f"synthtask scaffold promote {scaffold_run_id} /path/to/canonical-task-root",
             )
         else:
             try:
                 lifecycle.promote_scaffold(conn, scaffold_run_id, config.canonical_root)
             except lifecycle.LifecycleError as exc:
-                return _blocked(result, "promote", str(exc), f"ideation scaffold promote {scaffold_run_id}")
+                return _blocked(result, "promote", str(exc), f"synthtask scaffold promote {scaffold_run_id}")
             result.completed.append("promote")
 
     if should_continue("smoldata"):
@@ -232,7 +232,7 @@ def run(conn, config: PipelineRunConfig) -> PipelineRunResult:
                 result,
                 "smoldata",
                 "Smoldata upload is external; record the resulting task name once uploaded",
-                f"ideation submission record {scaffold_run_id} --platform smoldata --external-id <task> --status pending",
+                f"synthtask submission record {scaffold_run_id} --platform smoldata --external-id <task> --status pending",
             )
         try:
             watched = smoldata.watch_task(

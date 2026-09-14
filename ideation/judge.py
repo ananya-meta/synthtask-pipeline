@@ -54,7 +54,7 @@ def _load_rubric() -> str:
     if text.strip().startswith("<!-- TODO"):
         raise JudgeError(
             f"{RUBRIC_PATH} is still the empty placeholder. Write the rubric criteria "
-            f"before running `ideation judge`."
+            f"before running `synthtask judge`."
         )
     return text
 

@@ -692,7 +692,7 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
             {
                 "stage": "contract",
                 "target": f"idea:{row['id']}",
-                "action": f"ideation contract create {row['id']}",
+                "action": f"synthtask contract create {row['id']}",
                 "reason": "accepted idea has no task contract",
                 "title": row["title"],
             }
@@ -710,7 +710,7 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
             action = (
                 f"fill contract #{row['id']} fields: {', '.join(missing)}"
                 if missing
-                else f"ideation contract ready {row['id']}"
+                else f"synthtask contract ready {row['id']}"
             )
             actions.append(
                 {
@@ -736,7 +736,7 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
                 {
                     "stage": "scaffold",
                     "target": f"contract:{row['id']}",
-                    "action": f"ideation scaffold start {row['id']} --builder codex",
+                    "action": f"synthtask scaffold start {row['id']} --builder codex",
                     "reason": "ready contract has no scaffold workspace",
                     "idea_id": row["idea_id"],
                 }
@@ -758,7 +758,7 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
                 {
                     "stage": "verify",
                     "target": f"scaffold:{row['id']}",
-                    "action": f"ideation verify run {row['id']} --cwd task -- <command>",
+                    "action": f"synthtask verify run {row['id']} --cwd task -- <command>",
                     "reason": "scaffold has no passing verification",
                     "contract_id": row["contract_id"],
                 }
@@ -784,7 +784,7 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
                 {
                     "stage": "audit",
                     "target": f"scaffold:{row['id']}",
-                    "action": f"ideation audit record {row['id']} --reviewer <name> --verdict approve",
+                    "action": f"synthtask audit record {row['id']} --reviewer <name> --verdict approve",
                     "reason": "verified scaffold has no approving adversarial review",
                     "contract_id": row["contract_id"],
                 }
@@ -807,7 +807,7 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
                 {
                     "stage": "submission",
                     "target": f"scaffold:{row['id']}",
-                    "action": f"ideation submission record {row['id']} --platform smoldata --status pending",
+                    "action": f"synthtask submission record {row['id']} --platform smoldata --status pending",
                     "reason": "approved scaffold has no recorded validation result",
                     "contract_id": row["contract_id"],
                 }

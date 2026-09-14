@@ -1,11 +1,12 @@
 [project]
-name = "ideation"
+name = "synthtask-pipeline"
 version = "0.1.0"
-description = "Ideation pipeline: research papers -> deduped, scored, human-gated task ideas"
+description = "Synthetic task pipeline: research discovery -> scaffold -> validation feedback"
 requires-python = ">=3.11"
 dependencies = []
 
 [project.scripts]
+synthtask = "ideation.cli:main"
 ideation = "ideation.cli:main"
 
 [build-system]

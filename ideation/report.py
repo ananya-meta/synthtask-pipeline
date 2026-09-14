@@ -1,4 +1,4 @@
-"""Metrics over the ideation corpus.
+"""Metrics over the synthetic task pipeline corpus.
 
 The point of this module is that ideation stops being anecdotal. Diversity, per-generator
 yield, and judge-vs-human agreement are all tracked per prompt/rubric version, so a change
@@ -269,7 +269,7 @@ def render(conn) -> str:
     lines += ["", "HUMAN REJECTION REASONS", "─" * 62]
     hist = reason_histogram(conn)
     if not hist:
-        lines.append("  (nothing reviewed yet — run `ideation review`)")
+        lines.append("  (nothing reviewed yet — run `synthtask review`)")
     total_reviewed = sum(n for _, n in hist) or 1
     for code, n in hist:
         lines.append(f"  {code:<20} {n:>3}  {_bar(n / total_reviewed)}")

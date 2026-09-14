@@ -1,4 +1,4 @@
-"""Command line entry point: `ideation <command>`."""
+"""Command line entry point: `synthtask <command>`."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ def cmd_seed_search(args) -> int:
         print(
             f"  [{r['arxiv_id']}] {r['year']}  cites={r['citations']:>4}  {r['title'][:88]}"
         )
-    print(f"\nadd one with:  ideation seed add --arxiv-id <ID> --lane {args.sort_by and 'llm-eval'}")
+    print(f"\nadd one with:  synthtask seed add --arxiv-id <ID> --lane {args.sort_by and 'llm-eval'}")
     return 0
 
 
@@ -35,7 +35,7 @@ def cmd_seed_list(args) -> int:
     conn = db.connect(args.db)
     rows = db.list_seeds(conn)
     if not rows:
-        print("no seeds yet — try `ideation seed search \"...\"`")
+        print("no seeds yet — try `synthtask seed search \"...\"`")
         return 0
     for r in rows:
         n = conn.execute(
@@ -190,7 +190,7 @@ def cmd_contract_create(args) -> int:
         print("  status: draft")
         print(f"  missing for ready: {', '.join(missing)}")
     else:
-        print(f"  status: readyable — run `ideation contract ready {contract_id}`")
+        print(f"  status: readyable — run `synthtask contract ready {contract_id}`")
     return 0
 
 
@@ -554,8 +554,8 @@ def cmd_smoldata_rerun(args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="ideation", description=__doc__)
-    p.add_argument("--db", default=None, help="path to ideation.db")
+    p = argparse.ArgumentParser(prog="synthtask", description=__doc__)
+    p.add_argument("--db", default=None, help="path to the pipeline SQLite DB")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     seed = sub.add_parser("seed", help="manage paper seeds").add_subparsers(
