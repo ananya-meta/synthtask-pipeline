@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ideation import db, dedup, generate, lifecycle, report
+from ideation import db, dedup, generate, lifecycle, orchestrator, report, smoldata
 
 
 def make_corpus(conn):
@@ -432,6 +432,120 @@ class TestLifecycle(unittest.TestCase):
         second = lifecycle.next_actions(self.conn)
         self.assertEqual(second[0]["stage"], "scaffold")
         self.assertIn(str(contract_id), second[0]["action"])
+
+
+class TestOrchestrator(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conn = db.connect(Path(self.tmp.name) / "t.db")
+        self.seed_id, self.runs = make_corpus(self.conn)
+        self.idea_id = db.add_idea(
+            self.conn,
+            self.runs["codex"],
+            self.seed_id,
+            {
+                "title": "taskable idea",
+                "statement": "Build a verifier-backed task.",
+                "assumption_broken": "paper assumes easy validation",
+            },
+        )
+        db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def _config(self, **kw):
+        base = {
+            "idea_id": self.idea_id,
+            "stop_after": "scaffold",
+            "contract_overrides": {
+                "hidden_principle": "Hidden semantic cases.",
+                "allowed_inputs": '["visible fixtures"]',
+                "forbidden_leaks": '["hidden oracle"]',
+                "oracle_strategy": "Run hidden oracle.",
+                "mutation_strategy": "Reject noop.",
+                "infra_requirements": "stdlib Python.",
+                "difficulty_target": "Not trivial.",
+            },
+        }
+        base.update(kw)
+        return orchestrator.PipelineRunConfig(**base)
+
+    def test_pipeline_run_reaches_scaffold(self):
+        result = orchestrator.run(self.conn, self._config())
+        self.assertEqual(result.blocked_at, "")
+        self.assertEqual(result.completed, ["contract", "ready", "scaffold"])
+        self.assertIn("scaffold_run_id", result.ids)
+
+    def test_pipeline_blocks_at_build_without_prompt(self):
+        result = orchestrator.run(self.conn, self._config(stop_after="build"))
+        self.assertEqual(result.blocked_at, "build")
+        self.assertIn("builder prompt file", result.reason)
+
+    def test_pipeline_blocks_at_smoldata_external_upload_boundary(self):
+        contract_id = lifecycle.create_contract(
+            self.conn,
+            self.idea_id,
+            hidden_principle="Hidden semantic cases.",
+            allowed_inputs='["visible fixtures"]',
+            forbidden_leaks='["hidden oracle"]',
+            oracle_strategy="Run hidden oracle.",
+            mutation_strategy="Reject noop.",
+            infra_requirements="stdlib Python.",
+            difficulty_target="Not trivial.",
+        )
+        self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
+        scaffold_id, _ = lifecycle.start_scaffold(self.conn, contract_id)
+        lifecycle.record_review(
+            self.conn,
+            scaffold_id,
+            reviewer="tbh",
+            kind="adversarial",
+            verdict="approve",
+        )
+        lifecycle.run_verification(
+            self.conn,
+            scaffold_id,
+            [sys.executable, "-c", "print('ok')"],
+        )
+        canonical = Path(self.tmp.name) / "canonical"
+        result = orchestrator.run(
+            self.conn,
+            orchestrator.PipelineRunConfig(
+                contract_id=contract_id,
+                scaffold_run_id=scaffold_id,
+                canonical_root=canonical,
+                stop_after="smoldata",
+            ),
+        )
+        self.assertEqual(result.blocked_at, "smoldata")
+        self.assertIn("upload is external", result.reason)
+
+
+class TestSmoldata(unittest.TestCase):
+    def test_show_task_normalizes_status(self):
+        completed = subprocess.CompletedProcess(
+            ["codimango"],
+            0,
+            stdout='banner\n{"task": {"status": "accepted"}}\n',
+            stderr="",
+        )
+        with mock.patch.object(smoldata.subprocess, "run", return_value=completed):
+            result = smoldata.show_task("task-123")
+        self.assertEqual(result["status"], "accepted")
+
+    def test_agentic_review_treats_bad_review_exit_as_payload(self):
+        completed = subprocess.CompletedProcess(
+            ["codimango"],
+            1,
+            stdout='{"verdict": "BAD_GRADING_WEAK", "authorFeedback": "tighten oracle"}',
+            stderr="",
+        )
+        with mock.patch.object(smoldata.subprocess, "run", return_value=completed):
+            result = smoldata.agentic_review("task-123", fail_on_bad=True)
+        self.assertEqual(result["status"], "bad_grading_weak")
+        self.assertEqual(result["returncode"], 1)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import db, dedup, generate, judge, lifecycle, report, seeds
+from . import db, dedup, generate, judge, lifecycle, orchestrator, report, seeds, smoldata
 
 
 def cmd_seed_search(args) -> int:
@@ -450,6 +450,109 @@ def cmd_pipeline_status(args) -> int:
     return 0
 
 
+def cmd_pipeline_run(args) -> int:
+    verify_commands = [orchestrator.parse_command(cmd) for cmd in args.verify_command]
+    overrides = {
+        "objective": args.objective,
+        "hidden_principle": args.hidden_principle,
+        "allowed_inputs": json.dumps(args.allowed_input or []),
+        "forbidden_leaks": json.dumps(args.forbidden_leak or []),
+        "oracle_strategy": args.oracle_strategy,
+        "mutation_strategy": args.mutation_strategy,
+        "infra_requirements": args.infra_requirement,
+        "difficulty_target": args.difficulty_target,
+    }
+    conn = db.connect(args.db)
+    config = orchestrator.PipelineRunConfig(
+        idea_id=args.idea_id,
+        contract_id=args.contract_id,
+        scaffold_run_id=args.scaffold_run_id,
+        bundle_id=args.bundle_id,
+        builder=args.builder,
+        model=args.model or "",
+        build_prompt_file=Path(args.build_prompt_file) if args.build_prompt_file else None,
+        verify_commands=verify_commands,
+        canonical_root=Path(args.canonical_root) if args.canonical_root else None,
+        smoldata_task_name=args.smoldata_task_name or "",
+        smoldata_site=args.smoldata_site,
+        source_repo=args.source_repo or "",
+        stop_after=args.stop_after,
+        force_contract=args.force_contract,
+        allow_draft_scaffold=args.allow_draft_scaffold,
+        contract_overrides=overrides,
+    )
+    try:
+        result = orchestrator.run(conn, config)
+    except orchestrator.OrchestratorError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(result.as_dict(), indent=2, ensure_ascii=False))
+    return 1 if result.blocked_at else 0
+
+
+def cmd_smoldata_show(args) -> int:
+    try:
+        payload = smoldata.show_task(args.task_name, site=args.site, timeout=args.timeout)
+    except smoldata.SmoldataError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_smoldata_watch(args) -> int:
+    conn = db.connect(args.db)
+    try:
+        payload = smoldata.watch_task(args.task_name, site=args.site, timeout=args.timeout)
+    except smoldata.SmoldataError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if args.scaffold_run_id:
+        record = smoldata.submission_record(
+            args.task_name,
+            status=payload["status"],
+            payload={"watch": payload.get("payload")},
+        )
+        lifecycle.record_submission(conn, args.scaffold_run_id, **record)
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_smoldata_review(args) -> int:
+    conn = db.connect(args.db)
+    try:
+        payload = smoldata.agentic_review(
+            args.task_name,
+            site=args.site,
+            source_repo=args.source_repo or "",
+            wait=args.wait,
+            fail_on_bad=args.fail_on_bad,
+            timeout=args.timeout,
+        )
+    except smoldata.SmoldataError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if args.scaffold_run_id:
+        record = smoldata.submission_record(
+            args.task_name,
+            status=payload["status"],
+            payload={"review": payload.get("payload")},
+        )
+        lifecycle.record_submission(conn, args.scaffold_run_id, **record)
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return payload.get("returncode", 0)
+
+
+def cmd_smoldata_rerun(args) -> int:
+    try:
+        payload = smoldata.rerun_task(args.task_name, site=args.site, timeout=args.timeout)
+    except smoldata.SmoldataError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ideation", description=__doc__)
     p.add_argument("--db", default=None, help="path to ideation.db")
@@ -650,6 +753,64 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--json", action="store_true")
     ps.add_argument("--limit", type=int, default=20)
     ps.set_defaults(func=cmd_pipeline_status)
+
+    pr = pipeline.add_parser("run", help="advance one task through the controller stages")
+    pr.add_argument("--idea-id", type=int, default=None)
+    pr.add_argument("--contract-id", type=int, default=None)
+    pr.add_argument("--scaffold-run-id", type=int, default=None)
+    pr.add_argument("--bundle-id", type=int, default=None)
+    pr.add_argument("--builder", default="codex", help="codex | tbh")
+    pr.add_argument("--model", default="")
+    pr.add_argument("--build-prompt-file", default="")
+    pr.add_argument("--verify-command", action="append", default=[])
+    pr.add_argument("--canonical-root", default="")
+    pr.add_argument("--smoldata-task-name", default="")
+    pr.add_argument("--smoldata-site", default="default", choices=["default", "nest", "vanilla"])
+    pr.add_argument("--source-repo", default="")
+    pr.add_argument("--stop-after", default="learn", choices=orchestrator.STAGES)
+    pr.add_argument("--force-contract", action="store_true")
+    pr.add_argument("--allow-draft-scaffold", action="store_true")
+    pr.add_argument("--objective", default=None)
+    pr.add_argument("--hidden-principle", default=None)
+    pr.add_argument("--allowed-input", action="append", default=[])
+    pr.add_argument("--forbidden-leak", action="append", default=[])
+    pr.add_argument("--oracle-strategy", default=None)
+    pr.add_argument("--mutation-strategy", default=None)
+    pr.add_argument("--infra-requirement", default=None)
+    pr.add_argument("--difficulty-target", default=None)
+    pr.set_defaults(func=cmd_pipeline_run)
+
+    sd = sub.add_parser("smoldata", help="watch and import Smoldata/Codimango feedback").add_subparsers(
+        dest="smoldata_cmd", required=True
+    )
+    sh = sd.add_parser("show", help="show a Smoldata/Codimango task")
+    sh.add_argument("task_name")
+    sh.add_argument("--site", default="default", choices=["default", "nest", "vanilla"])
+    sh.add_argument("--timeout", type=int, default=900)
+    sh.set_defaults(func=cmd_smoldata_show)
+
+    sw = sd.add_parser("watch", help="watch validation and optionally record the result")
+    sw.add_argument("task_name")
+    sw.add_argument("--site", default="default", choices=["default", "nest", "vanilla"])
+    sw.add_argument("--timeout", type=int, default=3600)
+    sw.add_argument("--scaffold-run-id", type=int, default=None)
+    sw.set_defaults(func=cmd_smoldata_watch)
+
+    srv = sd.add_parser("review", help="fetch Agentic Full-Task Review")
+    srv.add_argument("task_name")
+    srv.add_argument("--site", default="default", choices=["default", "nest", "vanilla"])
+    srv.add_argument("--source-repo", default="")
+    srv.add_argument("--wait", action="store_true")
+    srv.add_argument("--fail-on-bad", action="store_true")
+    srv.add_argument("--timeout", type=int, default=3600)
+    srv.add_argument("--scaffold-run-id", type=int, default=None)
+    srv.set_defaults(func=cmd_smoldata_review)
+
+    srr = sd.add_parser("rerun", help="request validation rerun")
+    srr.add_argument("task_name")
+    srr.add_argument("--site", default="default", choices=["default", "nest", "vanilla"])
+    srr.add_argument("--timeout", type=int, default=900)
+    srr.set_defaults(func=cmd_smoldata_rerun)
 
     return p
 

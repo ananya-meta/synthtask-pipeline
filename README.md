@@ -124,6 +124,61 @@ ideation learn add --scope-type submission --scope-id 1 \
 ideation pipeline status
 ```
 
+`ideation pipeline run` can advance one task through the same gates until it reaches a
+real blocker:
+
+```bash
+ideation pipeline run \
+  --idea-id 42 \
+  --bundle-id 1 \
+  --builder codex \
+  --build-prompt-file /path/to/build_prompt.md \
+  --verify-command "python3 -m unittest discover -s tests -v" \
+  --canonical-root /path/to/canonical-task-root \
+  --stop-after promote
+```
+
+## Where Smoldata Fits
+
+Smoldata is the external validation and feedback gate, not the source of task ideas and
+not the local build harness.
+
+```text
+local harness:
+  discovery -> ideas -> contract -> scaffold -> local verifier -> adversarial review
+
+external validation:
+  upload canonical task -> Smoldata/Codimango agents run -> Agentic Full-Task Review
+
+feedback loop:
+  Smoldata result -> triage label -> targeted revision -> local verifier -> resubmit
+```
+
+The installed `codimango` CLI currently exposes inspection, watch, rerun, trial artifact,
+and Agentic Full-Task Review commands. It does not expose task creation in this harness.
+So submission/upload remains an explicit external step, and this repo records the
+resulting task name or ID:
+
+```bash
+ideation smoldata watch my-task-name --scaffold-run-id 1
+ideation smoldata review my-task-name --wait --scaffold-run-id 1
+ideation smoldata rerun my-task-name
+```
+
+Smoldata feedback is mapped into controller routing:
+
+| Smoldata signal | Pipeline route |
+|---|---|
+| `accepted` | done |
+| `pending` | poll again |
+| `infra` / `infra_error` | fix Docker/runtime/artifacts |
+| `bad_grading_weak` | strengthen hidden oracle and mutation tests |
+| `grading_wrong` | fix verifier contract |
+| `too_easy` | reduce leakage or add hidden state/scale |
+| `too_hard` | simplify or retarget |
+| `leak` | separate visible task from hidden scoring |
+| `timeout` | reduce runtime or budget |
+
 ## Isolation
 
 Valentina's Codex-vs-TBH comparison was invalidated because the agents could read each

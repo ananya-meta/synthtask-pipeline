@@ -47,7 +47,7 @@ shapes what tasks come out. Harness code is fine.
 ## Layout
 
 ```
-ideation/   db · seeds · generate · dedup · judge · review · lifecycle · report · cli
+ideation/   db · seeds · generate · dedup · judge · review · lifecycle · orchestrator · smoldata · report · cli
 prompts/    human-authored (see prompts/README.md)
 seeds/NN-slug/   abstract.md · paper.md · ASSUMPTIONS.md · meta.json
 runs/<seed>/<generator>/<ts>/   idea-generation isolation roots
