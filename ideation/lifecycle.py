@@ -843,9 +843,14 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
     if remaining:
         published_without_submission = conn.execute(
             "SELECT p.scaffold_run_id, p.task_name FROM publish_records p"
-            " WHERE p.status IN ('published', 'no_changes')"
-            " AND NOT EXISTS (SELECT 1 FROM submissions sub WHERE sub.scaffold_run_id = p.scaffold_run_id)"
-            " ORDER BY p.created_at DESC LIMIT ?",
+            " JOIN ("
+            "   SELECT scaffold_run_id, MAX(id) AS id"
+            "   FROM publish_records"
+            "   WHERE status IN ('published', 'no_changes')"
+            "   GROUP BY scaffold_run_id"
+            " ) latest ON latest.id = p.id"
+            " WHERE NOT EXISTS (SELECT 1 FROM submissions sub WHERE sub.scaffold_run_id = p.scaffold_run_id)"
+            " ORDER BY p.created_at DESC, p.id DESC LIMIT ?",
             (remaining,),
         ).fetchall()
         for row in published_without_submission:

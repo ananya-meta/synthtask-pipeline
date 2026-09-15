@@ -24,12 +24,14 @@ DIMENSIONS = ("novelty", "feasibility", "difficulty", "interestingness", "verifi
 SCORE_SCHEMA = {
     "type": "object",
     "required": ["scores"],
+    "additionalProperties": False,
     "properties": {
         "scores": {
             "type": "array",
             "items": {
                 "type": "object",
                 "required": ["idea_id", *DIMENSIONS, "rationale"],
+                "additionalProperties": False,
                 "properties": {
                     "idea_id": {"type": "integer"},
                     **{d: {"type": "number"} for d in DIMENSIONS},
@@ -155,12 +157,14 @@ def score_ideas(conn, seed_ref: str | None = None, batch: int = 10, limit: int |
 DUPE_SCHEMA = {
     "type": "object",
     "required": ["verdicts"],
+    "additionalProperties": False,
     "properties": {
         "verdicts": {
             "type": "array",
             "items": {
                 "type": "object",
                 "required": ["idea_id", "matched_idea_id", "same_task", "rationale"],
+                "additionalProperties": False,
                 "properties": {
                     "idea_id": {"type": "integer"},
                     "matched_idea_id": {"type": "integer"},

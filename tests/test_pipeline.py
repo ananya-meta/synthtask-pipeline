@@ -269,6 +269,7 @@ class TestIsolation(unittest.TestCase):
             root = Path(tmp)
             (root / "abstract.md").write_text("a")
             (root / "PROMPT.md").write_text("p")
+            (root / ".schema.json").write_text("{}")
             generate.assert_isolated(root)  # clean root: must not raise
 
             (root / "other_agents_ideas.json").write_text("{}")
@@ -575,6 +576,21 @@ class TestLifecycle(unittest.TestCase):
         self.assertEqual(actions[0]["stage"], "smoldata")
         self.assertIn("synthtask smoldata watch canonical-task", actions[0]["action"])
 
+        db.add_publish_record(
+            self.conn,
+            scaffold_run_id=scaffold_id,
+            task_name="canonical-task",
+            remote_url="https://github.com/codimango/ananyajain-tbench.git",
+            branch="main",
+            commit_sha="def456",
+            github_url="https://github.com/codimango/ananyajain-tbench/tree/def456/canonical-task",
+            status="published",
+            payload_json="{}",
+        )
+        actions = [action for action in lifecycle.next_actions(self.conn) if action["stage"] == "smoldata"]
+        self.assertEqual(len(actions), 1)
+        self.assertIn("synthtask smoldata watch canonical-task", actions[0]["action"])
+
 
 class TestPublisher(unittest.TestCase):
     def setUp(self):
@@ -777,7 +793,9 @@ class TestOrchestrator(unittest.TestCase):
         self.assertIn("scaffold_run_id", result.ids)
 
     def test_pipeline_blocks_at_build_without_prompt(self):
-        result = orchestrator.run(self.conn, self._config(stop_after="build"))
+        missing_prompt = Path(self.tmp.name) / "missing-build-prompt.md"
+        with mock.patch.object(orchestrator, "DEFAULT_BUILD_PROMPT", missing_prompt):
+            result = orchestrator.run(self.conn, self._config(stop_after="build"))
         self.assertEqual(result.blocked_at, "build")
         self.assertIn("builder prompt file", result.reason)
 

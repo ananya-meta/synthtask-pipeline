@@ -15,6 +15,8 @@ from typing import Any
 
 from . import db, lifecycle, publisher, smoldata
 
+DEFAULT_BUILD_PROMPT = db.REPO_ROOT / "prompts" / "build_task.md"
+
 STAGES = (
     "contract",
     "ready",
@@ -153,9 +155,12 @@ def run(conn, config: PipelineRunConfig) -> PipelineRunResult:
     if should_continue("build"):
         scaffold = db.get_scaffold_run(conn, scaffold_run_id)
         built_states = {"built", "verified", "reviewed", "promoted", "submitted", "accepted"}
+        build_prompt_file = config.build_prompt_file
+        if build_prompt_file is None and DEFAULT_BUILD_PROMPT.exists():
+            build_prompt_file = DEFAULT_BUILD_PROMPT
         if scaffold is not None and scaffold["state"] in built_states:
             result.completed.append("build")
-        elif config.build_prompt_file is None:
+        elif build_prompt_file is None:
             return _blocked(
                 result,
                 "build",
@@ -167,7 +172,7 @@ def run(conn, config: PipelineRunConfig) -> PipelineRunResult:
                 rc = lifecycle.run_scaffold_worker(
                     conn,
                     scaffold_run_id,
-                    config.build_prompt_file,
+                    build_prompt_file,
                 )
             except lifecycle.LifecycleError as exc:
                 return _blocked(result, "build", str(exc), f"synthtask scaffold run {scaffold_run_id}")

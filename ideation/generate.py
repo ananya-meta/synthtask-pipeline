@@ -27,12 +27,20 @@ SEED_FILES = ("abstract.md", "paper.md", "ASSUMPTIONS.md")
 IDEA_SCHEMA = {
     "type": "object",
     "required": ["ideas"],
+    "additionalProperties": False,
     "properties": {
         "ideas": {
             "type": "array",
             "items": {
                 "type": "object",
-                "required": ["title", "statement", "assumption_broken"],
+                "required": [
+                    "title",
+                    "statement",
+                    "assumption_broken",
+                    "difficulty_claim",
+                    "dataset_ref",
+                ],
+                "additionalProperties": False,
                 "properties": {
                     "title": {"type": "string"},
                     "statement": {"type": "string"},
@@ -98,7 +106,14 @@ def make_isolation_root(seed_dir: Path, generator: str) -> Path:
 
 def assert_isolated(root: Path) -> None:
     """Fail loudly if anything other than seed material leaked into the root."""
-    allowed = set(SEED_FILES) | {"PROMPT.md", "ideas.json", "stdout.log", "stderr.log", "last_message.txt"}
+    allowed = set(SEED_FILES) | {
+        ".schema.json",
+        "PROMPT.md",
+        "ideas.json",
+        "stdout.log",
+        "stderr.log",
+        "last_message.txt",
+    }
     stray = [p.name for p in root.iterdir() if p.name not in allowed]
     if stray:
         raise GeneratorError(f"isolation breach in {root}: unexpected entries {stray}")
