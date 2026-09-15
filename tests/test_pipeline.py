@@ -503,6 +503,19 @@ class TestLifecycle(unittest.TestCase):
         ).fetchone()
         self.assertEqual(outcome["accepted"], 0)
         self.assertEqual(outcome["smoldata_task_id"], "task-123")
+        action = lifecycle.next_actions(self.conn)[0]
+        self.assertEqual(action["stage"], "triage")
+        self.assertEqual(action["route"], "strengthen_oracle")
+
+        lifecycle.record_learning(
+            self.conn,
+            scope_type="submission",
+            scope_id=submission_id,
+            label="bad-grading-weak",
+            detail="tighten hidden oracle",
+        )
+        action = lifecycle.next_actions(self.conn)[0]
+        self.assertEqual(action["action"], f"synthtask scaffold start {contract_id} --builder codex")
 
     def test_next_actions_advance_from_accepted_idea_to_scaffold(self):
         db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
@@ -901,6 +914,26 @@ class TestSmoldata(unittest.TestCase):
         with mock.patch.object(smoldata.subprocess, "run", return_value=completed):
             result = smoldata.show_task("task-123")
         self.assertEqual(result["status"], "accepted")
+
+    def test_failed_validation_prefers_actionable_reason(self):
+        payload = {
+            "task": {
+                "status": "draft",
+                "validationStatus": "failed",
+                "validationDetails": [
+                    {
+                        "label": "Metacode or Opus pass/fail balance",
+                        "status": "failed",
+                        "detail": "Too easy - all agents passed 5/5",
+                    }
+                ],
+            }
+        }
+        self.assertEqual(smoldata._status_from_payload(payload), "too_easy")
+
+    def test_pending_validation_is_not_reported_as_draft(self):
+        payload = {"status": "draft", "validationStatus": "pending"}
+        self.assertEqual(smoldata._status_from_payload(payload), "pending")
 
     def test_agentic_review_treats_bad_review_exit_as_payload(self):
         completed = subprocess.CompletedProcess(

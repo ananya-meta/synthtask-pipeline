@@ -56,14 +56,68 @@ def _site_args(site: str) -> list[str]:
 
 def _status_from_payload(payload: Any) -> str:
     if isinstance(payload, dict):
-        for key in ("status", "state", "validationStatus", "reviewStatus"):
-            value = payload.get(key)
-            if isinstance(value, str) and value:
-                return value.lower()
         nested = payload.get("task")
         if isinstance(nested, dict):
-            return _status_from_payload(nested)
+            nested_status = _status_from_payload(nested)
+            if nested_status != "unknown":
+                return nested_status
+
+        validation_status = _string_value(payload, "validationStatus")
+        if validation_status:
+            normalized = validation_status.lower()
+            if normalized == "failed":
+                return _failure_status_from_details(payload) or "rejected"
+            if normalized in {"pending", "running"}:
+                return "pending"
+            if normalized in {"passed", "success", "succeeded"}:
+                task_status = _string_value(payload, "status")
+                if task_status and task_status.lower() in {"accepted", "needs_revision"}:
+                    return task_status.lower()
+                return "passed"
+
+        for key in ("status", "state", "reviewStatus"):
+            value = _string_value(payload, key)
+            if value:
+                return value.lower()
     return "unknown"
+
+
+def _string_value(payload: dict, key: str) -> str:
+    value = payload.get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _failure_status_from_details(payload: dict) -> str:
+    details = payload.get("validationDetails")
+    if not isinstance(details, list):
+        return ""
+    failed_details = [
+        item
+        for item in details
+        if isinstance(item, dict)
+        and str(item.get("status", "")).lower() in {"failed", "fail"}
+    ]
+    if not failed_details:
+        failed_details = [item for item in details if isinstance(item, dict)]
+    text = " ".join(
+        " ".join(str(item.get(key, "")) for key in ("label", "status", "detail"))
+        for item in failed_details
+    ).lower()
+    patterns = (
+        ("too easy", "too_easy"),
+        ("bad_grading_weak", "bad_grading_weak"),
+        ("bad grading weak", "bad_grading_weak"),
+        ("weak grading", "bad_grading_weak"),
+        ("grading wrong", "grading_wrong"),
+        ("too hard", "too_hard"),
+        ("leak", "leak"),
+        ("timeout", "timeout"),
+        ("infra", "infra_error"),
+    )
+    for needle, status in patterns:
+        if needle in text:
+            return status
+    return ""
 
 
 def show_task(task_name: str, *, site: str = "default", timeout: int = 900) -> dict:

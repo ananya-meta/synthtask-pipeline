@@ -752,6 +752,9 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
             "   SELECT 1 FROM verification_runs v"
             "   WHERE v.scaffold_run_id = s.id AND v.status = 'pass'"
             " )"
+            " AND NOT EXISTS ("
+            "   SELECT 1 FROM submissions sub WHERE sub.scaffold_run_id = s.id"
+            " )"
             " ORDER BY s.started_at DESC LIMIT ?",
             (remaining,),
         ).fetchall()
@@ -778,6 +781,9 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
             "   SELECT 1 FROM review_records r"
             "   WHERE r.scaffold_run_id = s.id AND r.verdict = 'approve'"
             " )"
+            " AND NOT EXISTS ("
+            "   SELECT 1 FROM submissions sub WHERE sub.scaffold_run_id = s.id"
+            " )"
             " ORDER BY s.started_at DESC LIMIT ?",
             (remaining,),
         ).fetchall()
@@ -800,6 +806,9 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
             " AND EXISTS ("
             "   SELECT 1 FROM review_records r"
             "   WHERE r.scaffold_run_id = s.id AND r.verdict = 'approve'"
+            " )"
+            " AND NOT EXISTS ("
+            "   SELECT 1 FROM submissions sub WHERE sub.scaffold_run_id = s.id"
             " )"
             " ORDER BY s.started_at DESC LIMIT ?",
             (remaining,),
@@ -825,6 +834,7 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
             "   WHERE r.scaffold_run_id = s.id AND r.verdict = 'approve'"
             " )"
             " AND NOT EXISTS (SELECT 1 FROM publish_records p WHERE p.scaffold_run_id = s.id)"
+            " AND NOT EXISTS (SELECT 1 FROM submissions sub WHERE sub.scaffold_run_id = s.id)"
             " ORDER BY s.started_at DESC LIMIT ?",
             (remaining,),
         ).fetchall()
@@ -860,6 +870,47 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
                     "target": f"scaffold:{row['scaffold_run_id']}",
                     "action": f"synthtask smoldata watch {row['task_name']} --scaffold-run-id {row['scaffold_run_id']}",
                     "reason": "published task has no recorded Codimango validation result",
+                }
+            )
+
+    remaining = max(limit - len(actions), 0)
+    if remaining:
+        latest_failed_submissions = conn.execute(
+            "SELECT sub.id, sub.scaffold_run_id, sub.status, sr.contract_id,"
+            " EXISTS ("
+            "   SELECT 1 FROM learning_events l"
+            "   WHERE l.scope_type = 'submission' AND l.scope_id = sub.id"
+            " ) AS has_learning"
+            " FROM submissions sub"
+            " JOIN ("
+            "   SELECT scaffold_run_id, MAX(id) AS id"
+            "   FROM submissions"
+            "   GROUP BY scaffold_run_id"
+            " ) latest ON latest.id = sub.id"
+            " JOIN scaffold_runs sr ON sr.id = sub.scaffold_run_id"
+            " WHERE LOWER(sub.status) NOT IN ('accepted', 'passed', 'pending')"
+            " ORDER BY sub.updated_at DESC, sub.id DESC LIMIT ?",
+            (remaining,),
+        ).fetchall()
+        for row in latest_failed_submissions:
+            route = triage_route(row["status"])
+            action = (
+                f"synthtask scaffold start {row['contract_id']} --builder codex"
+                if row["has_learning"]
+                else (
+                    f"record learning for {row['status']} and start a revised "
+                    f"scaffold for contract #{row['contract_id']}"
+                )
+            )
+            actions.append(
+                {
+                    "stage": "triage",
+                    "target": f"submission:{row['id']}",
+                    "action": action,
+                    "reason": f"latest Smoldata status routes to {route}",
+                    "scaffold_run_id": row["scaffold_run_id"],
+                    "contract_id": row["contract_id"],
+                    "route": route,
                 }
             )
 
