@@ -20,6 +20,8 @@ REQUIRED = (
     "instruction.md",
     "environment/Dockerfile",
     "tests/test.sh",
+    "tests/verifier.py",
+    "tests/score_from_ctrf.py",
 )
 
 
@@ -40,14 +42,22 @@ def check_required(root: Path) -> None:
     mode = (root / "tests" / "test.sh").stat().st_mode
     if not mode & stat.S_IXUSR:
         fail("tests/test.sh is not executable")
+    test_sh = (root / "tests" / "test.sh").read_text(errors="replace")
+    if "/tests/" not in test_sh:
+        fail("tests/test.sh must support the Harbor /tests mount")
+    if "/logs/verifier/reward.txt" not in test_sh:
+        fail("tests/test.sh must write /logs/verifier/reward.txt")
 
 
 def check_task_toml(root: Path) -> None:
     with (root / "task.toml").open("rb") as handle:
         data = tomllib.load(handle)
     task_name = str((data.get("task") or {}).get("name") or "")
+    track_assignment = str((data.get("task") or {}).get("track_assignment") or "")
     if "/" not in task_name or task_name.endswith("/"):
         fail("[task].name must include an org/name value")
+    if track_assignment not in {"t-bench-external-repos", "t-bench-multi-turn"}:
+        fail("[task].track_assignment must be a supported T-Bench track")
     reward = str((data.get("metadata") or {}).get("reward_type") or "")
     if reward != "binary":
         fail("[metadata].reward_type must be binary")
@@ -96,6 +106,73 @@ def run_test(root: Path) -> int:
     return int(value)
 
 
+def score_ctrf(ctrf: Path, reward: Path) -> int:
+    value = reward.read_text().strip()
+    if value not in {"0", "1"}:
+        fail(f"reward.txt must contain 0 or 1, got {value!r}")
+    try:
+        summary = json.loads(ctrf.read_text()).get("results", {}).get("summary", {})
+        tests = int(summary.get("tests", 0))
+        passed = int(summary.get("passed", 0))
+        failed = int(summary.get("failed", 0))
+        other = int(summary.get("other", 0))
+    except Exception as exc:
+        fail(f"ctrf.json is not parseable: {exc}")
+    expected = 1 if tests > 0 and passed == tests and failed == 0 and other == 0 else 0
+    if int(value) != expected:
+        fail("reward.txt does not match ctrf.json summary")
+    return int(value)
+
+
+def run_mounted_verifier(task_root: Path, workspace: Path, logs: Path) -> int:
+    ctrf = logs / "ctrf.json"
+    reward = logs / "reward.txt"
+    ctrf.unlink(missing_ok=True)
+    reward.unlink(missing_ok=True)
+    logs.mkdir(parents=True, exist_ok=True)
+    verifier = task_root / "tests" / "verifier.py"
+    scorer = task_root / "tests" / "score_from_ctrf.py"
+    proc = subprocess.run(
+        [sys.executable, "-I", "-S", str(verifier), "--ctrf", str(ctrf)],
+        cwd=workspace,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    subprocess.run(
+        [sys.executable, "-I", "-S", str(scorer), str(ctrf), str(reward)],
+        cwd=workspace,
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    if not reward.exists():
+        fail(
+            "mounted verifier did not write reward.txt\n"
+            f"stdout:\n{proc.stdout[-2000:]}\nstderr:\n{proc.stderr[-2000:]}"
+        )
+    return score_ctrf(ctrf, reward)
+
+
+def check_environment_context(source: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="synthtask-env-check-") as tmp:
+        root = Path(tmp)
+        workspace = root / "workspace"
+        solution = root / "solution"
+        logs = root / "logs"
+        shutil.copytree(source / "environment", workspace)
+        shutil.copytree(source / "solution", solution)
+
+        before = run_mounted_verifier(source, workspace, logs)
+        if before != 0:
+            fail("environment build context passes before applying solution")
+        subprocess.run(["bash", str(solution / "solve.sh")], cwd=workspace, check=True, timeout=60)
+        after = run_mounted_verifier(source, workspace, logs)
+        if after != 1:
+            fail("environment build context does not pass after applying solution")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("task_dir", type=Path)
@@ -115,6 +192,8 @@ def main(argv: list[str] | None = None) -> int:
         after = run_test(work)
         if after != 1:
             fail("task does not pass after applying solution")
+
+    check_environment_context(source)
 
     print("PASS: task fails before solution and passes after solution")
     return 0
