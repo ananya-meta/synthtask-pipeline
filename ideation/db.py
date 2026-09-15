@@ -185,6 +185,19 @@ CREATE TABLE IF NOT EXISTS submissions (
     updated_at      REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS publish_records (
+    id              INTEGER PRIMARY KEY,
+    scaffold_run_id INTEGER NOT NULL REFERENCES scaffold_runs(id),
+    task_name       TEXT NOT NULL,
+    remote_url      TEXT NOT NULL,
+    branch          TEXT NOT NULL,
+    commit_sha      TEXT,
+    github_url      TEXT,
+    status          TEXT NOT NULL,
+    payload_json    TEXT NOT NULL,
+    created_at      REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS learning_events (
     id           INTEGER PRIMARY KEY,
     scope_type   TEXT NOT NULL,
@@ -201,6 +214,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_seed  ON runs(seed_id);
 CREATE INDEX IF NOT EXISTS idx_contracts_idea ON task_contracts(idea_id);
 CREATE INDEX IF NOT EXISTS idx_scaffolds_contract ON scaffold_runs(contract_id);
 CREATE INDEX IF NOT EXISTS idx_submissions_scaffold ON submissions(scaffold_run_id);
+CREATE INDEX IF NOT EXISTS idx_publish_scaffold ON publish_records(scaffold_run_id);
 """
 
 
@@ -574,6 +588,28 @@ def add_submission(conn: sqlite3.Connection, **kw: Any) -> int:
     )
     conn.commit()
     return cur.lastrowid
+
+
+def add_publish_record(conn: sqlite3.Connection, **kw: Any) -> int:
+    kw.setdefault("created_at", time.time())
+    cols = ", ".join(kw)
+    marks = ", ".join("?" for _ in kw)
+    cur = conn.execute(
+        f"INSERT INTO publish_records ({cols}) VALUES ({marks})",
+        tuple(kw.values()),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def publish_record_for_scaffold(
+    conn: sqlite3.Connection, scaffold_run_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM publish_records WHERE scaffold_run_id = ?"
+        " ORDER BY created_at DESC, id DESC LIMIT 1",
+        (scaffold_run_id,),
+    ).fetchone()
 
 
 def add_learning_event(conn: sqlite3.Connection, **kw: Any) -> int:

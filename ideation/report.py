@@ -309,7 +309,8 @@ def render(conn) -> str:
     lines.append(
         f"  verifications {pl['verification_runs']}"
         f"   passing {pl['passing_verifications']}   reviews {pl['reviews']}"
-        f"   submissions {pl['submissions']}   learnings {pl['learning_events']}"
+        f"   published {pl['published']}   submissions {pl['submissions']}"
+        f"   learnings {pl['learning_events']}"
     )
     for item in pl["latest_submissions"]:
         ident = item["external_id"] or f"submission #{item['id']}"

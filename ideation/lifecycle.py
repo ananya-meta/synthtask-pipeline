@@ -51,6 +51,7 @@ SCAFFOLD_ALLOWED = {
 TRIAGE_ROUTE = {
     "accepted": "done",
     "pending": "poll",
+    "published": "poll",
     "infra": "fix_infra",
     "infra_error": "fix_infra",
     "bad_grading_weak": "strengthen_oracle",
@@ -670,6 +671,7 @@ def pipeline_summary(conn) -> dict:
         "passing_verifications": q("SELECT COUNT(*) FROM verification_runs WHERE status = 'pass'"),
         "reviews": q("SELECT COUNT(*) FROM review_records"),
         "submissions": q("SELECT COUNT(*) FROM submissions"),
+        "published": q("SELECT COUNT(*) FROM publish_records WHERE status IN ('published', 'no_changes')"),
         "learning_events": q("SELECT COUNT(*) FROM learning_events"),
         "latest_submissions": latest_submissions,
     }
@@ -792,24 +794,67 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
 
     remaining = max(limit - len(actions), 0)
     if remaining:
-        approved_without_submission = conn.execute(
+        approved_without_promote = conn.execute(
             "SELECT s.id, s.contract_id FROM scaffold_runs s"
-            " WHERE EXISTS ("
+            " WHERE s.canonical_root IS NULL"
+            " AND EXISTS ("
             "   SELECT 1 FROM review_records r"
             "   WHERE r.scaffold_run_id = s.id AND r.verdict = 'approve'"
             " )"
-            " AND NOT EXISTS (SELECT 1 FROM submissions sub WHERE sub.scaffold_run_id = s.id)"
             " ORDER BY s.started_at DESC LIMIT ?",
             (remaining,),
         ).fetchall()
-        for row in approved_without_submission:
+        for row in approved_without_promote:
             actions.append(
                 {
-                    "stage": "submission",
+                    "stage": "promote",
                     "target": f"scaffold:{row['id']}",
-                    "action": f"synthtask submission record {row['id']} --platform smoldata --status pending",
-                    "reason": "approved scaffold has no recorded validation result",
+                    "action": f"synthtask scaffold promote {row['id']} /path/to/canonical-task-root",
+                    "reason": "approved scaffold has not been promoted to canonical task bytes",
                     "contract_id": row["contract_id"],
+                }
+            )
+
+    remaining = max(limit - len(actions), 0)
+    if remaining:
+        approved_without_publish = conn.execute(
+            "SELECT s.id, s.contract_id FROM scaffold_runs s"
+            " WHERE s.canonical_root IS NOT NULL"
+            " AND EXISTS ("
+            "   SELECT 1 FROM review_records r"
+            "   WHERE r.scaffold_run_id = s.id AND r.verdict = 'approve'"
+            " )"
+            " AND NOT EXISTS (SELECT 1 FROM publish_records p WHERE p.scaffold_run_id = s.id)"
+            " ORDER BY s.started_at DESC LIMIT ?",
+            (remaining,),
+        ).fetchall()
+        for row in approved_without_publish:
+            actions.append(
+                {
+                    "stage": "publish",
+                    "target": f"scaffold:{row['id']}",
+                    "action": f"synthtask publish run {row['id']} --task-name <task-name>",
+                    "reason": "approved scaffold has not been published to the task repo",
+                    "contract_id": row["contract_id"],
+                }
+            )
+
+    remaining = max(limit - len(actions), 0)
+    if remaining:
+        published_without_submission = conn.execute(
+            "SELECT p.scaffold_run_id, p.task_name FROM publish_records p"
+            " WHERE p.status IN ('published', 'no_changes')"
+            " AND NOT EXISTS (SELECT 1 FROM submissions sub WHERE sub.scaffold_run_id = p.scaffold_run_id)"
+            " ORDER BY p.created_at DESC LIMIT ?",
+            (remaining,),
+        ).fetchall()
+        for row in published_without_submission:
+            actions.append(
+                {
+                    "stage": "smoldata",
+                    "target": f"scaffold:{row['scaffold_run_id']}",
+                    "action": f"synthtask smoldata watch {row['task_name']} --scaffold-run-id {row['scaffold_run_id']}",
+                    "reason": "published task has no recorded Codimango validation result",
                 }
             )
 

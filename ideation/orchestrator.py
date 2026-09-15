@@ -2,7 +2,7 @@
 
 This module turns the lifecycle primitives into an end-to-end controller. It is allowed
 to stop at explicit external boundaries: incomplete contracts, missing builder prompts,
-local verification failures, and manual Smoldata upload.
+local verification failures, publish failures, and pending Smoldata validation.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import db, lifecycle, smoldata
+from . import db, lifecycle, publisher, smoldata
 
 STAGES = (
     "contract",
@@ -23,6 +23,7 @@ STAGES = (
     "verify",
     "audit",
     "promote",
+    "publish",
     "smoldata",
     "learn",
 )
@@ -43,6 +44,13 @@ class PipelineRunConfig:
     build_prompt_file: Path | None = None
     verify_commands: list[list[str]] = field(default_factory=list)
     canonical_root: Path | None = None
+    publish_task_name: str = ""
+    publish_remote: str = ""
+    publish_branch: str = publisher.DEFAULT_BRANCH
+    publish_message: str = ""
+    publish_push: bool = True
+    publish_overwrite: bool = False
+    publish_method: str = "auto"
     smoldata_task_name: str = ""
     smoldata_site: str = "default"
     source_repo: str = ""
@@ -226,29 +234,89 @@ def run(conn, config: PipelineRunConfig) -> PipelineRunResult:
                 return _blocked(result, "promote", str(exc), f"synthtask scaffold promote {scaffold_run_id}")
             result.completed.append("promote")
 
+    if should_continue("publish"):
+        publish_record = db.publish_record_for_scaffold(conn, scaffold_run_id)
+        if publish_record is not None:
+            result.ids["publish_record_id"] = publish_record["id"]
+            result.ids["published_task_name"] = publish_record["task_name"]
+            result.completed.append("publish")
+        else:
+            scaffold = db.get_scaffold_run(conn, scaffold_run_id)
+            if scaffold is None:
+                return _blocked(result, "publish", "scaffold disappeared", "inspect scaffold list")
+            if not scaffold["canonical_root"]:
+                return _blocked(
+                    result,
+                    "publish",
+                    "scaffold has no canonical root",
+                    f"synthtask scaffold promote {scaffold_run_id} /path/to/canonical-task-root",
+                )
+            task_name = (
+                config.publish_task_name
+                or config.smoldata_task_name
+                or Path(scaffold["canonical_root"]).name
+            )
+            try:
+                publish_record_id = publisher.publish_scaffold(
+                    conn,
+                    scaffold_run_id,
+                    task_name=task_name,
+                    remote_url=config.publish_remote or None,
+                    branch=config.publish_branch,
+                    message=config.publish_message,
+                    push=config.publish_push,
+                    overwrite=config.publish_overwrite,
+                    method=config.publish_method,
+                )
+            except publisher.PublishError as exc:
+                return _blocked(
+                    result,
+                    "publish",
+                    str(exc),
+                    f"synthtask publish run {scaffold_run_id} --task-name {task_name}",
+                )
+            publish_record = db.publish_record_for_scaffold(conn, scaffold_run_id)
+            result.ids["publish_record_id"] = publish_record_id
+            result.ids["published_task_name"] = task_name
+            if publish_record is not None:
+                result.ids["published_github_url"] = publish_record["github_url"]
+            result.completed.append("publish")
+
     if should_continue("smoldata"):
-        if not config.smoldata_task_name:
+        task_name = config.smoldata_task_name
+        publish_record = db.publish_record_for_scaffold(conn, scaffold_run_id)
+        if not task_name and publish_record is not None:
+            task_name = publish_record["task_name"]
+        if publish_record is not None and publish_record["status"] == "committed":
             return _blocked(
                 result,
                 "smoldata",
-                "Smoldata upload is external; record the resulting task name once uploaded",
-                f"synthtask submission record {scaffold_run_id} --platform smoldata --external-id <task> --status pending",
+                "task was committed in a temporary publish clone but not pushed",
+                f"synthtask publish run {scaffold_run_id} --task-name {publish_record['task_name']}",
+            )
+        if not task_name:
+            return _blocked(
+                result,
+                "smoldata",
+                "task is not published yet; Codimango needs the task repo path before validation can be watched",
+                f"synthtask publish run {scaffold_run_id} --task-name <task-name>",
             )
         try:
             watched = smoldata.watch_task(
-                config.smoldata_task_name,
+                task_name,
                 site=config.smoldata_site,
             )
             review = smoldata.agentic_review(
-                config.smoldata_task_name,
+                task_name,
                 site=config.smoldata_site,
-                source_repo=config.source_repo,
+                source_repo=config.source_repo
+                or (publisher.github_repo_name(publish_record["remote_url"]) if publish_record else ""),
                 wait=False,
             )
         except smoldata.SmoldataError as exc:
-            return _blocked(result, "smoldata", str(exc), f"codimango api tasks show {config.smoldata_task_name}")
+            return _blocked(result, "smoldata", str(exc), f"codimango api tasks show {task_name}")
         record = smoldata.submission_record(
-            config.smoldata_task_name,
+            task_name,
             status=review["status"] or watched["status"],
             payload={"watch": watched.get("payload"), "review": review.get("payload")},
         )

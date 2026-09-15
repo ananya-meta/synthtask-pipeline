@@ -9,7 +9,8 @@ artifacts the controller explicitly copies in.
 An end-to-end synthetic task pipeline for the AAI *Research Papers to Tasks* track. It
 takes research seeds or discovery bundles through ranked, deduplicated,
 human-adjudicated **task ideas**, then tracks task contracts, isolated scaffold
-workspaces, verification, reviews, submissions, and learning events.
+workspaces, verification, reviews, task-repo publication, submissions, and learning
+events.
 
 ## Authorship boundary — read before editing
 
@@ -41,13 +42,16 @@ shapes what tasks come out. Harness code is fine.
    tracked generation rather than mutating history.
 4. **Canonical promotion is controller-only.** Workers write in staging. A scaffold becomes
    canonical only through `synthtask scaffold promote`.
-5. **Stdlib only.** No third-party runtime dependencies — the tool must run with system
+5. **Task-repo publication is controller-owned.** Use `synthtask publish run`; it writes
+   through a temporary clone/API path and records the commit. Do not copy into a dirty
+   benchmark checkout by hand.
+6. **Stdlib only.** No third-party runtime dependencies — the tool must run with system
    Python and no venv.
 
 ## Layout
 
 ```
-ideation/   db · seeds · generate · dedup · judge · review · lifecycle · orchestrator · smoldata · report · cli
+ideation/   db · seeds · generate · dedup · judge · review · lifecycle · orchestrator · publisher · smoldata · report · cli
 prompts/    human-authored (see prompts/README.md)
 seeds/NN-slug/   abstract.md · paper.md · ASSUMPTIONS.md · meta.json
 runs/<seed>/<generator>/<ts>/   idea-generation isolation roots

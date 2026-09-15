@@ -4,11 +4,13 @@ Synthetic task generation pipeline for the AAI **Research Papers to Tasks** trac
 
 Research paper or graph-discovery bundle → candidate task ideas → deduped →
 rubric-scored → human-adjudicated → task contract → isolated scaffold workspace →
-verification/review → submission triage → learning loop.
+verification/review → task-repo publication → Smoldata/Codimango validation →
+submission triage → learning loop.
 
 The first half keeps every idea and every rejection so the pipeline can be measured and
-tuned. The second half keeps every scaffold, verifier result, reviewer verdict, and
-submission outcome so task construction improves from evidence instead of memory.
+tuned. The second half keeps every scaffold, verifier result, reviewer verdict,
+publish commit, and submission outcome so task construction improves from evidence
+instead of memory.
 
 ## Why ideation
 
@@ -112,15 +114,22 @@ synthtask audit record 1 --reviewer tbh --kind adversarial --verdict revise \
 # 7. promote only approved staged files into an empty canonical task root
 synthtask scaffold promote 1 /path/to/canonical-task-root
 
-# 8. record Smoldata/Codimango results and preserve the triage route
+# 8. publish the approved task into the GitHub repo Codimango ingests
+synthtask publish run 1 --task-name my-task-name
+
+# 9. watch Smoldata/Codimango and preserve the triage route
+synthtask smoldata watch my-task-name --scaffold-run-id 1
+synthtask smoldata review my-task-name --wait --scaffold-run-id 1
+
+# You can also record an external status explicitly if needed.
 synthtask submission record 1 --platform smoldata --external-id abc-123 \
   --status bad_grading_weak --pass-rate 1.0 --revisions 2
 
-# 9. write durable learning events for later A/B tests
+# 10. write durable learning events for later A/B tests
 synthtask learn add --scope-type submission --scope-id 1 \
   --label weak-grader --detail "public cases did not cover stateful edge cases"
 
-# 10. see controller state and queued next actions
+# 11. see controller state and queued next actions
 synthtask pipeline status
 ```
 
@@ -135,7 +144,8 @@ synthtask pipeline run \
   --build-prompt-file /path/to/build_prompt.md \
   --verify-command "python3 -m unittest discover -s tests -v" \
   --canonical-root /path/to/canonical-task-root \
-  --stop-after promote
+  --publish-task-name my-task-name \
+  --stop-after publish
 ```
 
 ## Where Smoldata Fits
@@ -148,22 +158,29 @@ local harness:
   discovery -> ideas -> contract -> scaffold -> local verifier -> adversarial review
 
 external validation:
-  upload canonical task -> Smoldata/Codimango agents run -> Agentic Full-Task Review
+  publish task repo commit -> Codimango ingestion -> Smoldata/Codimango agents run
+  -> Agentic Full-Task Review
 
 feedback loop:
   Smoldata result -> triage label -> targeted revision -> local verifier -> resubmit
 ```
 
-The installed `codimango` CLI currently exposes inspection, watch, rerun, trial artifact,
-and Agentic Full-Task Review commands. It does not expose task creation in this harness.
-So submission/upload remains an explicit external step, and this repo records the
-resulting task name or ID:
+The installed `codimango` CLI exposes inspection, watch, rerun, trial artifact, and
+Agentic Full-Task Review commands. It does not expose task creation in this harness, so
+the pipeline now automates the available ingestion path: copy the promoted canonical task
+into your Codimango task repository, commit/push it, and record the commit-addressed
+GitHub URL plus an inventory digest.
 
 ```bash
+synthtask publish run 1 --task-name my-task-name
 synthtask smoldata watch my-task-name --scaffold-run-id 1
 synthtask smoldata review my-task-name --wait --scaffold-run-id 1
 synthtask smoldata rerun my-task-name
 ```
+
+By default `synthtask publish run` uses `SYNTH_TASK_REMOTE`, or the sibling
+`/data/repos/ananyajain-tbench` remote when present. It publishes through a temporary
+clone or GitHub API fallback, so it does not modify a dirty benchmark checkout.
 
 Smoldata feedback is mapped into controller routing:
 

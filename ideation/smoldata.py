@@ -2,8 +2,9 @@
 
 The local harness builds and hardens tasks. Smoldata/Codimango is the external
 validation gate: it runs agents, produces pass-rate and review signals, and feeds the
-revision loop. The installed CLI exposes inspection/review/rerun commands; task upload
-is intentionally represented as an external action that the controller records.
+revision loop. Task creation happens through the publisher: it commits promoted task
+bytes into the GitHub task repo that Codimango ingests, then this module watches and
+records the resulting validation/review state.
 """
 
 from __future__ import annotations

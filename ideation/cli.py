@@ -7,7 +7,18 @@ import json
 import sys
 from pathlib import Path
 
-from . import db, dedup, generate, judge, lifecycle, orchestrator, report, seeds, smoldata
+from . import (
+    db,
+    dedup,
+    generate,
+    judge,
+    lifecycle,
+    orchestrator,
+    publisher,
+    report,
+    seeds,
+    smoldata,
+)
 
 
 def cmd_seed_search(args) -> int:
@@ -412,6 +423,57 @@ def cmd_submission_record(args) -> int:
     return 0
 
 
+def cmd_publish_run(args) -> int:
+    conn = db.connect(args.db)
+    try:
+        record_id = publisher.publish_scaffold(
+            conn,
+            args.scaffold_run_id,
+            task_name=args.task_name or None,
+            remote_url=args.remote or None,
+            branch=args.branch,
+            message=args.message or "",
+            push=not args.no_push,
+            overwrite=args.overwrite,
+            method=args.method,
+        )
+    except publisher.PublishError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    row = conn.execute("SELECT * FROM publish_records WHERE id = ?", (record_id,)).fetchone()
+    payload = json.loads(row["payload_json"])
+    print(f"publish #{record_id}: {row['status']} {row['task_name']}")
+    if payload.get("github_url"):
+        print(f"  github: {payload['github_url']}")
+    print(f"  remote: {row['remote_url']} ({row['branch']})")
+    print(f"  method: {payload.get('method', 'git')}")
+    print(f"  inventory_sha256: {payload.get('inventory_sha256', '-')}")
+    return 0
+
+
+def cmd_publish_list(args) -> int:
+    conn = db.connect(args.db)
+    rows = conn.execute(
+        "SELECT * FROM publish_records ORDER BY created_at DESC, id DESC LIMIT ?",
+        (args.limit,),
+    ).fetchall()
+    if args.json:
+        print(json.dumps([dict(r) for r in rows], indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("no publish records yet")
+        return 0
+    for row in rows:
+        sha = (row["commit_sha"] or "")[:12] or "-"
+        print(
+            f"  #{row['id']:<3} scaffold #{row['scaffold_run_id']:<3} "
+            f"{row['status']:<10} {row['task_name']:<48} {sha}"
+        )
+        if row["github_url"]:
+            print(f"      {row['github_url']}")
+    return 0
+
+
 def cmd_learn_add(args) -> int:
     conn = db.connect(args.db)
     payload = {}
@@ -452,7 +514,8 @@ def cmd_pipeline_status(args) -> int:
     )
     print(
         f"  verifications {s['verification_runs']}   reviews {s['reviews']}"
-        f"   submissions {s['submissions']}   learnings {s['learning_events']}"
+        f"   published {s['published']}   submissions {s['submissions']}"
+        f"   learnings {s['learning_events']}"
     )
     print("")
     print("NEXT ACTIONS")
@@ -488,6 +551,13 @@ def cmd_pipeline_run(args) -> int:
         build_prompt_file=Path(args.build_prompt_file) if args.build_prompt_file else None,
         verify_commands=verify_commands,
         canonical_root=Path(args.canonical_root) if args.canonical_root else None,
+        publish_task_name=args.publish_task_name or "",
+        publish_remote=args.publish_remote or "",
+        publish_branch=args.publish_branch,
+        publish_message=args.publish_message or "",
+        publish_push=not args.no_push,
+        publish_overwrite=args.overwrite_publish,
+        publish_method=args.publish_method,
         smoldata_task_name=args.smoldata_task_name or "",
         smoldata_site=args.smoldata_site,
         source_repo=args.source_repo or "",
@@ -750,6 +820,37 @@ def build_parser() -> argparse.ArgumentParser:
     sr.add_argument("--result-json", default="")
     sr.set_defaults(func=cmd_submission_record)
 
+    publish_cmd = sub.add_parser(
+        "publish",
+        help="publish promoted tasks to the Codimango-ingested repo",
+    ).add_subparsers(dest="publishcmd", required=True)
+    prun = publish_cmd.add_parser(
+        "run",
+        help="copy a promoted scaffold into the task repo and push",
+    )
+    prun.add_argument("scaffold_run_id", type=int)
+    prun.add_argument(
+        "--task-name",
+        default="",
+        help="top-level task directory name; defaults to canonical root name",
+    )
+    prun.add_argument(
+        "--remote",
+        default="",
+        help="task repo remote; defaults to SYNTH_TASK_REMOTE or sibling ananyajain-tbench",
+    )
+    prun.add_argument("--branch", default=publisher.DEFAULT_BRANCH)
+    prun.add_argument("--message", default="")
+    prun.add_argument("--method", default="auto", choices=["auto", "git", "github-api"])
+    prun.add_argument("--no-push", action="store_true", help="commit in a temp clone without pushing")
+    prun.add_argument("--overwrite", action="store_true", help="replace an existing task directory")
+    prun.set_defaults(func=cmd_publish_run)
+
+    plist = publish_cmd.add_parser("list", help="list task-repo publication records")
+    plist.add_argument("--json", action="store_true")
+    plist.add_argument("--limit", type=int, default=20)
+    plist.set_defaults(func=cmd_publish_list)
+
     learn = sub.add_parser("learn", help="record pipeline learning events").add_subparsers(
         dest="learncmd", required=True
     )
@@ -779,6 +880,17 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--build-prompt-file", default="")
     pr.add_argument("--verify-command", action="append", default=[])
     pr.add_argument("--canonical-root", default="")
+    pr.add_argument("--publish-task-name", default="")
+    pr.add_argument("--publish-remote", default="")
+    pr.add_argument("--publish-branch", default=publisher.DEFAULT_BRANCH)
+    pr.add_argument("--publish-message", default="")
+    pr.add_argument(
+        "--publish-method",
+        default="auto",
+        choices=["auto", "git", "github-api"],
+    )
+    pr.add_argument("--no-push", action="store_true")
+    pr.add_argument("--overwrite-publish", action="store_true")
     pr.add_argument("--smoldata-task-name", default="")
     pr.add_argument("--smoldata-site", default="default", choices=["default", "nest", "vanilla"])
     pr.add_argument("--source-repo", default="")

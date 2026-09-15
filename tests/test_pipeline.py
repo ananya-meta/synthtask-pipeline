@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ideation import cli, db, dedup, generate, lifecycle, orchestrator, report, smoldata
+from ideation import cli, db, dedup, generate, lifecycle, orchestrator, publisher, report, smoldata
 
 
 def make_corpus(conn):
@@ -28,6 +28,64 @@ def make_corpus(conn):
             prompt_version="v1", isolation_root=f"/tmp/{gen}",
         )
     return seed_id, runs
+
+
+def run_git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ("git", *args),
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+
+def make_bare_remote(root: Path) -> Path:
+    bare = root / "remote.git"
+    run_git("init", "-q", "--bare", "-b", "main", str(bare), cwd=root)
+    seed = root / "seed-repo"
+    seed.mkdir()
+    run_git("init", "-q", "-b", "main", ".", cwd=seed)
+    (seed / "README.md").write_text("tasks\n")
+    run_git("add", "-A", cwd=seed)
+    run_git(
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.com",
+        "commit",
+        "-qm",
+        "seed",
+        cwd=seed,
+    )
+    run_git("remote", "add", "origin", str(bare), cwd=seed)
+    run_git("push", "-q", "origin", "main", cwd=seed)
+    return bare
+
+
+def remote_files(remote: Path) -> list[str]:
+    out = run_git(
+        "-C",
+        str(remote),
+        "ls-tree",
+        "-r",
+        "--name-only",
+        "main",
+        cwd=remote,
+    )
+    return sorted(out.stdout.splitlines())
+
+
+def make_task_tree(root: Path, name: str = "task") -> Path:
+    task = root / name
+    (task / "tests").mkdir(parents=True, exist_ok=True)
+    (task / "environment").mkdir(exist_ok=True)
+    (task / "task.toml").write_text('[task]\nname = "demo"\n')
+    (task / "instruction.md").write_text("Build the requested solver.\n")
+    test_sh = task / "tests" / "test.sh"
+    test_sh.write_text("#!/bin/sh\nexit 0\n")
+    test_sh.chmod(0o755)
+    return task
 
 
 class TestDedup(unittest.TestCase):
@@ -467,6 +525,212 @@ class TestLifecycle(unittest.TestCase):
         self.assertEqual(second[0]["stage"], "scaffold")
         self.assertIn(str(contract_id), second[0]["action"])
 
+    def test_next_actions_include_publish_then_smoldata_watch(self):
+        db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
+        contract_id = lifecycle.create_contract(
+            self.conn,
+            self.idea_id,
+            hidden_principle="Hidden graph cases.",
+            allowed_inputs='["visible graph"]',
+            forbidden_leaks='["hidden graph"]',
+            oracle_strategy="Compare against hidden graph oracle.",
+            mutation_strategy="Reject constant outputs.",
+            infra_requirements="stdlib Python.",
+            difficulty_target="Not solved by a noop.",
+        )
+        self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
+        scaffold_id, root = lifecycle.start_scaffold(self.conn, contract_id)
+        make_task_tree(root, "task")
+        lifecycle.run_verification(
+            self.conn,
+            scaffold_id,
+            [sys.executable, "-c", "print('ok')"],
+        )
+        lifecycle.record_review(
+            self.conn,
+            scaffold_id,
+            reviewer="tbh",
+            kind="adversarial",
+            verdict="approve",
+        )
+        canonical = Path(self.tmp.name) / "canonical-task"
+        lifecycle.promote_scaffold(self.conn, scaffold_id, canonical)
+
+        actions = lifecycle.next_actions(self.conn)
+        self.assertEqual(actions[0]["stage"], "publish")
+        self.assertIn(f"synthtask publish run {scaffold_id}", actions[0]["action"])
+
+        db.add_publish_record(
+            self.conn,
+            scaffold_run_id=scaffold_id,
+            task_name="canonical-task",
+            remote_url="https://github.com/codimango/ananyajain-tbench.git",
+            branch="main",
+            commit_sha="abc123",
+            github_url="https://github.com/codimango/ananyajain-tbench/tree/abc123/canonical-task",
+            status="published",
+            payload_json="{}",
+        )
+        actions = lifecycle.next_actions(self.conn)
+        self.assertEqual(actions[0]["stage"], "smoldata")
+        self.assertIn("synthtask smoldata watch canonical-task", actions[0]["action"])
+
+
+class TestPublisher(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.db_path = self.root / "t.db"
+        self.conn = db.connect(self.db_path)
+        self.seed_id, self.runs = make_corpus(self.conn)
+        self.idea_id = db.add_idea(
+            self.conn,
+            self.runs["codex"],
+            self.seed_id,
+            {
+                "title": "publishable task",
+                "statement": "Build a task ready for publication.",
+                "assumption_broken": "manual handoff loses tasks",
+            },
+        )
+        db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def _promoted_scaffold(self) -> tuple[int, Path]:
+        contract_id = lifecycle.create_contract(
+            self.conn,
+            self.idea_id,
+            hidden_principle="Hidden semantic cases.",
+            allowed_inputs='["visible fixtures"]',
+            forbidden_leaks='["hidden oracle"]',
+            oracle_strategy="Run hidden oracle.",
+            mutation_strategy="Reject noop.",
+            infra_requirements="stdlib Python.",
+            difficulty_target="Not trivial.",
+        )
+        self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
+        scaffold_id, root = lifecycle.start_scaffold(self.conn, contract_id)
+        make_task_tree(root, "task")
+        canonical = self.root / "canonical-task"
+        lifecycle.promote_scaffold(self.conn, scaffold_id, canonical)
+        return scaffold_id, canonical
+
+    def test_publish_task_pushes_to_local_remote(self):
+        remote = make_bare_remote(self.root)
+        source = make_task_tree(self.root, "source-task")
+
+        result = publisher.publish_task(
+            source,
+            task_name="published-task",
+            remote_url=str(remote),
+            method="git",
+        )
+
+        self.assertEqual(result.status, "published")
+        self.assertTrue(result.pushed)
+        self.assertIn("published-task/task.toml", remote_files(remote))
+        self.assertIn("published-task/tests/test.sh", remote_files(remote))
+        self.assertEqual(
+            result.inventory_sha256,
+            publisher.inventory_sha256(publisher.task_inventory(source)),
+        )
+
+    def test_publish_task_is_idempotent_for_identical_bytes(self):
+        remote = make_bare_remote(self.root)
+        source = make_task_tree(self.root, "source-task")
+
+        publisher.publish_task(
+            source,
+            task_name="published-task",
+            remote_url=str(remote),
+            method="git",
+        )
+        second = publisher.publish_task(
+            source,
+            task_name="published-task",
+            remote_url=str(remote),
+            method="git",
+        )
+
+        self.assertEqual(second.status, "no_changes")
+        self.assertFalse(second.pushed)
+
+    def test_publish_scaffold_records_database_receipt(self):
+        remote = make_bare_remote(self.root)
+        scaffold_id, canonical = self._promoted_scaffold()
+
+        record_id = publisher.publish_scaffold(
+            self.conn,
+            scaffold_id,
+            task_name="canonical-task",
+            remote_url=str(remote),
+            method="git",
+        )
+
+        row = db.publish_record_for_scaffold(self.conn, scaffold_id)
+        payload = json.loads(row["payload_json"])
+        self.assertEqual(row["id"], record_id)
+        self.assertEqual(row["status"], "published")
+        self.assertEqual(row["task_name"], "canonical-task")
+        self.assertEqual(
+            payload["inventory_sha256"],
+            publisher.inventory_sha256(publisher.task_inventory(canonical)),
+        )
+        self.assertIn("canonical-task/task.toml", remote_files(remote))
+
+    def test_auto_publish_falls_back_to_github_api_for_private_repo_auth(self):
+        source = make_task_tree(self.root, "source-task")
+        expected = publisher.PublishResult(
+            task_name="published-task",
+            remote_url="org-272075201@github.com:codimango/ananyajain-tbench.git",
+            branch="main",
+            commit_sha="f" * 40,
+            github_url="https://github.com/codimango/ananyajain-tbench/tree/"
+            + ("f" * 40)
+            + "/published-task",
+            status="published",
+            pushed=True,
+            inventory_sha256=publisher.inventory_sha256(publisher.task_inventory(source)),
+            method="github-api",
+        )
+        with (
+            mock.patch.object(
+                publisher,
+                "_publish_task_git",
+                side_effect=publisher.PublishError("auth failed"),
+            ),
+            mock.patch.object(
+                publisher,
+                "_publish_task_github_api",
+                return_value=expected,
+            ) as api_publish,
+        ):
+            result = publisher.publish_task(
+                source,
+                task_name="published-task",
+                remote_url="org-272075201@github.com:codimango/ananyajain-tbench.git",
+                method="auto",
+            )
+
+        self.assertEqual(result.method, "github-api")
+        api_publish.assert_called_once()
+
+    def test_publish_refuses_controller_metadata(self):
+        source = make_task_tree(self.root, "source-task")
+        (source / ".factory").mkdir()
+        (source / ".factory" / "private.json").write_text("{}\n")
+
+        with self.assertRaises(publisher.PublishError):
+            publisher.publish_task(
+                source,
+                task_name="published-task",
+                remote_url=str(make_bare_remote(self.root)),
+                method="git",
+            )
+
 
 class TestOrchestrator(unittest.TestCase):
     def setUp(self):
@@ -517,7 +781,7 @@ class TestOrchestrator(unittest.TestCase):
         self.assertEqual(result.blocked_at, "build")
         self.assertIn("builder prompt file", result.reason)
 
-    def test_pipeline_blocks_at_smoldata_external_upload_boundary(self):
+    def test_pipeline_run_publishes_promoted_scaffold(self):
         contract_id = lifecycle.create_contract(
             self.conn,
             self.idea_id,
@@ -530,7 +794,8 @@ class TestOrchestrator(unittest.TestCase):
             difficulty_target="Not trivial.",
         )
         self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
-        scaffold_id, _ = lifecycle.start_scaffold(self.conn, contract_id)
+        scaffold_id, root = lifecycle.start_scaffold(self.conn, contract_id)
+        make_task_tree(root, "task")
         lifecycle.record_review(
             self.conn,
             scaffold_id,
@@ -544,17 +809,67 @@ class TestOrchestrator(unittest.TestCase):
             [sys.executable, "-c", "print('ok')"],
         )
         canonical = Path(self.tmp.name) / "canonical"
+        remote = make_bare_remote(Path(self.tmp.name))
         result = orchestrator.run(
             self.conn,
             orchestrator.PipelineRunConfig(
                 contract_id=contract_id,
                 scaffold_run_id=scaffold_id,
                 canonical_root=canonical,
+                publish_task_name="pipeline-task",
+                publish_remote=str(remote),
+                stop_after="publish",
+                publish_method="git",
+            ),
+        )
+        self.assertEqual(result.blocked_at, "")
+        self.assertIn("publish", result.completed)
+        self.assertIn("pipeline-task/task.toml", remote_files(remote))
+
+    def test_pipeline_blocks_at_smoldata_when_publish_was_not_pushed(self):
+        contract_id = lifecycle.create_contract(
+            self.conn,
+            self.idea_id,
+            hidden_principle="Hidden semantic cases.",
+            allowed_inputs='["visible fixtures"]',
+            forbidden_leaks='["hidden oracle"]',
+            oracle_strategy="Run hidden oracle.",
+            mutation_strategy="Reject noop.",
+            infra_requirements="stdlib Python.",
+            difficulty_target="Not trivial.",
+        )
+        self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
+        scaffold_id, root = lifecycle.start_scaffold(self.conn, contract_id)
+        make_task_tree(root, "task")
+        lifecycle.record_review(
+            self.conn,
+            scaffold_id,
+            reviewer="tbh",
+            kind="adversarial",
+            verdict="approve",
+        )
+        lifecycle.run_verification(
+            self.conn,
+            scaffold_id,
+            [sys.executable, "-c", "print('ok')"],
+        )
+        canonical = Path(self.tmp.name) / "canonical"
+        remote = make_bare_remote(Path(self.tmp.name))
+        result = orchestrator.run(
+            self.conn,
+            orchestrator.PipelineRunConfig(
+                contract_id=contract_id,
+                scaffold_run_id=scaffold_id,
+                canonical_root=canonical,
+                publish_task_name="pipeline-task",
+                publish_remote=str(remote),
+                publish_push=False,
+                publish_method="git",
                 stop_after="smoldata",
             ),
         )
         self.assertEqual(result.blocked_at, "smoldata")
-        self.assertIn("upload is external", result.reason)
+        self.assertIn("not pushed", result.reason)
 
 
 class TestSmoldata(unittest.TestCase):
