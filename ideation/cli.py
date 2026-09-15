@@ -625,6 +625,8 @@ def cmd_smoldata_review(args) -> int:
         )
         lifecycle.record_submission(conn, args.scaffold_run_id, **record)
     print(json.dumps(payload, indent=2, ensure_ascii=False))
+    if payload.get("status") == "pending":
+        return 0
     return payload.get("returncode", 0)
 
 

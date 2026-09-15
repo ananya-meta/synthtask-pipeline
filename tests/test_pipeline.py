@@ -947,6 +947,18 @@ class TestSmoldata(unittest.TestCase):
         self.assertEqual(result["status"], "bad_grading_weak")
         self.assertEqual(result["returncode"], 1)
 
+    def test_agentic_review_treats_in_flight_as_pending(self):
+        completed = subprocess.CompletedProcess(
+            ["codimango"],
+            1,
+            stdout='{"state": "in_flight", "review": null}',
+            stderr="",
+        )
+        with mock.patch.object(smoldata.subprocess, "run", return_value=completed):
+            result = smoldata.agentic_review("task-123")
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["returncode"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

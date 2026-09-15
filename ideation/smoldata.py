@@ -173,8 +173,15 @@ def agentic_review(
     except (json.JSONDecodeError, SmoldataError):
         payload = {"raw": result.stdout}
     verdict = _review_verdict(payload)
+    state = _string_value(payload, "state").lower() if isinstance(payload, dict) else ""
+    if state in {"in_flight", "not_run", "pending", "running"}:
+        status = "pending"
+    elif verdict:
+        status = verdict.lower()
+    else:
+        status = "bad" if result.returncode else "good"
     return {
-        "status": verdict.lower() if verdict else ("bad" if result.returncode else "good"),
+        "status": status,
         "verdict": verdict,
         "payload": payload,
         "raw": result.stdout,
