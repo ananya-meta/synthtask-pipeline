@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ideation import db, dedup, generate, lifecycle, orchestrator, report, smoldata
+from ideation import cli, db, dedup, generate, lifecycle, orchestrator, report, smoldata
 
 
 def make_corpus(conn):
@@ -33,7 +33,8 @@ def make_corpus(conn):
 class TestDedup(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.conn = db.connect(Path(self.tmp.name) / "t.db")
+        self.db_path = Path(self.tmp.name) / "t.db"
+        self.conn = db.connect(self.db_path)
         self.seed_id, self.runs = make_corpus(self.conn)
 
     def tearDown(self):
@@ -246,7 +247,8 @@ class TestIdeaParsing(unittest.TestCase):
 class TestLifecycle(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.conn = db.connect(Path(self.tmp.name) / "t.db")
+        self.db_path = Path(self.tmp.name) / "t.db"
+        self.conn = db.connect(self.db_path)
         self.seed_id, self.runs = make_corpus(self.conn)
         self.idea_id = db.add_idea(
             self.conn,
@@ -346,6 +348,38 @@ class TestLifecycle(unittest.TestCase):
             "SELECT status FROM verification_runs WHERE id = ?", (verify_id,)
         ).fetchone()["status"]
         self.assertEqual(status, "pass")
+
+    def test_verify_cli_accepts_options_after_scaffold_id(self):
+        db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
+        contract_id = lifecycle.create_contract(
+            self.conn,
+            self.idea_id,
+            hidden_principle="Hidden graph cases.",
+            allowed_inputs='["visible graph"]',
+            forbidden_leaks='["hidden graph"]',
+            oracle_strategy="Compare against hidden graph oracle.",
+            mutation_strategy="Reject constant outputs.",
+            infra_requirements="stdlib Python.",
+            difficulty_target="Not solved by a noop.",
+        )
+        self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
+        scaffold_id, _ = lifecycle.start_scaffold(self.conn, contract_id, builder="codex")
+        rc = cli.main(
+            [
+                "--db",
+                str(self.db_path),
+                "verify",
+                "run",
+                str(scaffold_id),
+                "--cwd",
+                "task",
+                "--",
+                sys.executable,
+                "-c",
+                "print('ok')",
+            ]
+        )
+        self.assertEqual(rc, 0)
 
     def test_scaffold_worker_renders_prompt_and_updates_state(self):
         db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")

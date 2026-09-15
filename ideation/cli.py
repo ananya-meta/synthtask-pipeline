@@ -306,6 +306,21 @@ def cmd_scaffold_run(args) -> int:
 
 def cmd_verify_run(args) -> int:
     command = args.command
+    cwd = args.cwd
+    verifier = args.verifier
+    timeout = args.timeout
+    while command and command[0] != "--":
+        if command[0] == "--cwd" and len(command) >= 2:
+            cwd = command[1]
+            command = command[2:]
+        elif command[0] == "--verifier" and len(command) >= 2:
+            verifier = command[1]
+            command = command[2:]
+        elif command[0] == "--timeout" and len(command) >= 2:
+            timeout = int(command[1])
+            command = command[2:]
+        else:
+            break
     if command and command[0] == "--":
         command = command[1:]
     conn = db.connect(args.db)
@@ -314,9 +329,9 @@ def cmd_verify_run(args) -> int:
             conn,
             args.scaffold_run_id,
             command,
-            verifier=args.verifier,
-            cwd_choice=args.cwd,
-            timeout=args.timeout,
+            verifier=verifier,
+            cwd_choice=cwd,
+            timeout=timeout,
         )
     except lifecycle.LifecycleError as exc:
         print(f"error: {exc}", file=sys.stderr)
