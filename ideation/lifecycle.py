@@ -35,9 +35,26 @@ CONTRACT_FIELDS = (
     "difficulty_target",
 )
 
+# Free-text fields that have to say something substantive for a builder to act on.
+# `infra_requirements` is deliberately excluded: "stdlib Python" is a complete answer.
+PROSE_CONTRACT_FIELDS = (
+    "objective",
+    "hidden_principle",
+    "oracle_strategy",
+    "mutation_strategy",
+    "difficulty_target",
+)
+MIN_PROSE_WORDS = 4
+FILLER_VALUES = {
+    "asdf", "asdfasdf", "foo", "bar", "baz", "qux", "test", "testing", "temp", "tmp",
+    "tbd", "tba", "todo", "xxx", "yyy", "zzz", "n/a", "na", "none", "null", "nil",
+    "placeholder", "lorem", "ipsum", "stuff", "things", "something", "whatever", "-",
+}
+
 SCAFFOLD_ALLOWED = {
     "TASK_CONTRACT.json",
     "TASK_CONTRACT.md",
+    "PRIOR_ATTEMPTS.md",
     "CONTROLLER_NOTES.md",
     "RUN_PROMPT.md",
     "worker_stdout.log",
@@ -63,6 +80,7 @@ TRIAGE_ROUTE = {
     "leak": "separate_visible_task_from_hidden_scoring",
     "timeout": "reduce_runtime_or_budget",
     "rejected": "triage_feedback",
+    "failed_unclassified": "manual_triage",
 }
 
 # Codimango has not reached a verdict yet. These must stay visible to the controller:
@@ -82,6 +100,12 @@ SCAFFOLD_RESTARTABLE_STATES = (
     "submitted",
     "accepted",
 )
+
+# Stated as an exclusion list on purpose. `scaffold_runs.state` records the last event on
+# the row, and seven call sites can write fifteen different values — an allowlist of
+# "already built" states silently omits new ones and re-invokes the builder on work that is
+# finished. Only these three mean the workspace has no build behind it.
+UNBUILT_STATES = ("started", "running", "build_failed")
 
 
 class LifecycleError(RuntimeError):
@@ -283,12 +307,34 @@ def contract_dict(row) -> dict:
     return obj
 
 
+def _is_filler(value: str) -> bool:
+    stripped = value.strip().strip(".").lower()
+    return stripped in FILLER_VALUES or all(
+        word in FILLER_VALUES for word in stripped.split()
+    )
+
+
 def validate_contract(row) -> list[str]:
+    """Reasons this contract is not ready, as machine-readable `field:reason` strings.
+
+    A heuristic floor, not a judgement of quality: it cannot tell a weak hidden principle
+    from a strong one, only a real one from a placeholder. The contract is the only thing
+    the builder reads, so `hidden_principle="asdf"` reaching `ready` is worth catching even
+    if `hidden_principle="hide the oracle"` still gets through.
+    """
     missing = []
     for field in CONTRACT_FIELDS:
         value = (row[field] or "").strip()
         if not value or value.startswith("TODO"):
             missing.append(field)
+            continue
+        if _is_filler(value):
+            missing.append(f"{field}:placeholder")
+            continue
+        if field in PROSE_CONTRACT_FIELDS and len(value.split()) < MIN_PROSE_WORDS:
+            missing.append(f"{field}:too_short")
+
+    parsed_lists: dict[str, list] = {}
     for field in ("allowed_inputs", "forbidden_leaks"):
         try:
             parsed = json.loads(row[field])
@@ -297,6 +343,20 @@ def validate_contract(row) -> list[str]:
             continue
         if not parsed:
             missing.append(field)
+            continue
+        entries = [str(item).strip() for item in parsed if str(item).strip()]
+        if not entries or all(_is_filler(entry) for entry in entries):
+            missing.append(f"{field}:placeholder")
+            continue
+        parsed_lists[field] = entries
+
+    allowed = parsed_lists.get("allowed_inputs")
+    forbidden = parsed_lists.get("forbidden_leaks")
+    if allowed and forbidden and {a.lower() for a in allowed} == {f.lower() for f in forbidden}:
+        # If everything the agent may read is also a forbidden leak, the contract has not
+        # actually decided what is hidden.
+        missing.append("forbidden_leaks:same_as_allowed_inputs")
+
     return missing
 
 
@@ -393,6 +453,10 @@ def start_scaffold(
     contract = contract_dict(row)
     (root / "TASK_CONTRACT.json").write_text(_json_dumps(contract) + "\n", encoding="utf-8")
     (root / "TASK_CONTRACT.md").write_text(_contract_markdown(contract), encoding="utf-8")
+    (root / "PRIOR_ATTEMPTS.md").write_text(
+        prior_attempts_markdown(prior_attempts(conn, contract_id, before_revision=revision)),
+        encoding="utf-8",
+    )
     (root / "CONTROLLER_NOTES.md").write_text(
         "# Controller Notes\n\n"
         "Build inside `task/`. Do not read sibling workspaces or copy files into canonical "
@@ -448,12 +512,151 @@ def promote_scaffold(conn, scaffold_run_id: int, canonical_root: Path) -> None:
     )
 
 
+def prior_attempts(conn, contract_id: int, before_revision: int | None = None) -> list[dict]:
+    """Per-revision history for a contract: what was tried and how it came back.
+
+    This is the input a revision needs and never had. Without it every revision of a
+    contract is built from byte-identical inputs, so a task rejected as `too_easy` twice
+    gets rebuilt a third time with no encoding of why.
+    """
+    query = "SELECT * FROM scaffold_runs WHERE contract_id = ?"
+    args: list[Any] = [contract_id]
+    if before_revision is not None:
+        query += " AND revision < ?"
+        args.append(before_revision)
+    query += " ORDER BY revision, id"
+
+    attempts = []
+    for scaffold in conn.execute(query, tuple(args)).fetchall():
+        verifications = conn.execute(
+            "SELECT status, command FROM verification_runs"
+            " WHERE scaffold_run_id = ? ORDER BY id",
+            (scaffold["id"],),
+        ).fetchall()
+        reviews = conn.execute(
+            "SELECT reviewer, kind, verdict, note FROM review_records"
+            " WHERE scaffold_run_id = ? ORDER BY id",
+            (scaffold["id"],),
+        ).fetchall()
+        submissions = conn.execute(
+            "SELECT id, status, pass_rate FROM submissions"
+            " WHERE scaffold_run_id = ? ORDER BY id",
+            (scaffold["id"],),
+        ).fetchall()
+
+        submission_entries = []
+        for row in submissions:
+            notes = [
+                {
+                    "label": event["label"],
+                    "detail": event["detail"],
+                    "payload": _load_jsonish(event["payload_json"], {}),
+                }
+                for event in db.learning_events_for(conn, "submission", row["id"])
+            ]
+            submission_entries.append(
+                {
+                    "submission_id": row["id"],
+                    "status": row["status"],
+                    "route": triage_route(row["status"]),
+                    "pass_rate": row["pass_rate"],
+                    "learnings": notes,
+                }
+            )
+
+        attempts.append(
+            {
+                "revision": scaffold["revision"],
+                "scaffold_run_id": scaffold["id"],
+                "builder": scaffold["builder"],
+                "model": scaffold["model"],
+                "state": scaffold["state"],
+                "verifications": [
+                    {"status": v["status"], "command": v["command"]} for v in verifications
+                ],
+                "reviews": [
+                    {
+                        "reviewer": r["reviewer"],
+                        "kind": r["kind"],
+                        "verdict": r["verdict"],
+                        "note": r["note"],
+                    }
+                    for r in reviews
+                ],
+                "submissions": submission_entries,
+                "learnings": [
+                    {"label": e["label"], "detail": e["detail"]}
+                    for e in db.learning_events_for(conn, "scaffold", scaffold["id"])
+                ],
+            }
+        )
+    return attempts
+
+
+def prior_attempts_markdown(attempts: list[dict]) -> str:
+    if not attempts:
+        return "No prior attempts — this is the first revision of this contract."
+
+    lines = [
+        f"{len(attempts)} prior attempt(s) at this contract. Each was rejected or is "
+        "still unresolved; do not reproduce the same outcome.",
+        "",
+    ]
+    for attempt in attempts:
+        lines.append(f"## Revision {attempt['revision']} ({attempt['builder']})")
+        lines.append(f"- Final state: `{attempt['state']}`")
+
+        failures = [v for v in attempt["verifications"] if v["status"] != "pass"]
+        if failures:
+            lines.append(f"- Local verification failed {len(failures)} time(s)")
+        for review in attempt["reviews"]:
+            note = f" — {review['note']}" if review["note"] else ""
+            lines.append(f"- Review ({review['reviewer']}): **{review['verdict']}**{note}")
+        for submission in attempt["submissions"]:
+            rate = (
+                f", pass rate {submission['pass_rate']}"
+                if submission["pass_rate"] is not None
+                else ""
+            )
+            lines.append(
+                f"- Codimango returned **{submission['status']}**{rate}"
+                f" → route `{submission['route']}`"
+            )
+            for note in submission["learnings"]:
+                detail = (note["detail"] or "").strip()
+                if detail:
+                    lines.append(f"    - {note['label']}: {detail}")
+        for note in attempt["learnings"]:
+            lines.append(f"- {note['label']}: {note['detail']}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def revision_guidance() -> str:
+    """Human-authored guidance on how to respond to a triage route, if it exists.
+
+    Optional by design: `prompts/` is human-authored, so the harness threads this file in
+    when it is written and stays silent when it is not.
+    """
+    path = db.REPO_ROOT / "prompts" / "revision_guidance.md"
+    if not path.exists():
+        return ""
+    text = path.read_text(encoding="utf-8")
+    return "" if text.strip().startswith("<!-- TODO") else text
+
+
 def _render_scaffold_prompt(template: str, root: Path) -> str:
     contract_json = (root / "TASK_CONTRACT.json").read_text(encoding="utf-8")
     contract_md = (root / "TASK_CONTRACT.md").read_text(encoding="utf-8")
+    attempts_path = root / "PRIOR_ATTEMPTS.md"
+    attempts_md = (
+        attempts_path.read_text(encoding="utf-8") if attempts_path.exists() else ""
+    )
     return (
         template.replace("{{TASK_CONTRACT_JSON}}", contract_json)
         .replace("{{TASK_CONTRACT_MD}}", contract_md)
+        .replace("{{PRIOR_ATTEMPTS}}", attempts_md)
+        .replace("{{REVISION_GUIDANCE}}", revision_guidance())
         .replace("{{WORKSPACE_ROOT}}", str(root))
         .replace("{{TASK_DIR}}", str(root / "task"))
     )
@@ -509,8 +712,18 @@ def run_scaffold_worker(
     prompt_path = prompt_file.expanduser().resolve()
     if not prompt_path.exists():
         raise LifecycleError(f"prompt file does not exist: {prompt_path}")
+    template = prompt_path.read_text(encoding="utf-8")
+    if scaffold["revision"] > 1 and "{{PRIOR_ATTEMPTS}}" not in template:
+        # Rebuilding from the same inputs that already failed is the failure mode this
+        # history exists to prevent, so refuse rather than silently repeat it.
+        raise LifecycleError(
+            f"scaffold run #{scaffold_run_id} is revision {scaffold['revision']}, but"
+            f" {prompt_path} has no {{{{PRIOR_ATTEMPTS}}}} token — the builder would repeat"
+            " the previous attempt blind. Add the token to the prompt (the rendered history"
+            " is also written to PRIOR_ATTEMPTS.md in the workspace)."
+        )
     root = Path(scaffold["workspace_root"])
-    prompt = _render_scaffold_prompt(prompt_path.read_text(encoding="utf-8"), root)
+    prompt = _render_scaffold_prompt(template, root)
     (root / "RUN_PROMPT.md").write_text(prompt, encoding="utf-8")
     assert_scaffold_isolated(root)
 
@@ -658,7 +871,7 @@ def record_submission(
             fields["smoldata_task_id"] = external_id
         if status == "accepted":
             fields["accepted"] = 1
-        elif status in {"rejected", "bad_grading_weak", "grading_wrong", "too_easy", "too_hard"}:
+        elif is_failed_status(status):
             fields["accepted"] = 0
         if pass_rate is not None:
             fields["pass_rate"] = pass_rate
@@ -670,7 +883,55 @@ def record_submission(
         scaffold_run_id,
         state="accepted" if status == "accepted" else "submitted",
     )
+    if is_failed_status(status):
+        _record_failure_learning(conn, submission_id, status, result or {})
     return submission_id
+
+
+def failure_detail_text(result: dict) -> str:
+    """Pull the reviewer prose out of a recorded submission payload.
+
+    Codimango nests the useful sentence several ways depending on which command produced
+    the payload, so this walks the known shapes rather than assuming one.
+    """
+    texts: list[str] = []
+    for blob in (result or {}).values():
+        if not isinstance(blob, dict):
+            continue
+        task = blob.get("task") if isinstance(blob.get("task"), dict) else blob
+        details = task.get("validationDetails") if isinstance(task, dict) else None
+        if isinstance(details, list):
+            for item in details:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("status", "")).lower() in {"failed", "fail"}:
+                    label = str(item.get("label", "")).strip()
+                    detail = str(item.get("detail", "")).strip()
+                    texts.append(f"{label}: {detail}" if label else detail)
+        for key in ("authorFeedback", "feedback", "summary"):
+            value = task.get(key) if isinstance(task, dict) else None
+            if isinstance(value, str) and value.strip():
+                texts.append(value.strip())
+    return "\n".join(dict.fromkeys(t for t in texts if t))
+
+
+def _record_failure_learning(conn, submission_id: int, status: str, result: dict) -> int:
+    """Capture the machine-visible half of a failure automatically.
+
+    Without this the triage route is a label nobody records, and the next revision is built
+    from the same inputs as the last one. Human notes still go through `learn add`; this
+    only guarantees the route and the reviewer prose are never lost.
+    """
+    route = triage_route(status)
+    detail = failure_detail_text(result)
+    return record_learning(
+        conn,
+        scope_type="submission",
+        scope_id=submission_id,
+        label="smoldata-failure",
+        detail=detail or f"Codimango returned {status!r} with no detail text.",
+        payload={"status": status, "route": route},
+    )
 
 
 def record_learning(
@@ -693,7 +954,23 @@ def record_learning(
 
 
 def triage_route(status: str) -> str:
-    return TRIAGE_ROUTE.get(status.lower().strip(), "manual_triage")
+    normalized = status.lower().strip()
+    if normalized in TRIAGE_ROUTE:
+        return TRIAGE_ROUTE[normalized]
+    # Unclassified failures carry the raw code as `failed_unclassified:<code>`.
+    return TRIAGE_ROUTE.get(normalized.split(":", 1)[0], "manual_triage")
+
+
+def is_failed_status(status: str) -> bool:
+    """Anything that has settled but is not a pass. Kept as the complement of the two
+    known-good sets so a new Codimango status is treated as a failure, not as success."""
+    normalized = status.lower().strip()
+    if not normalized:
+        return False
+    return (
+        normalized not in SETTLED_OK_SUBMISSION_STATUSES
+        and normalized not in POLLABLE_SUBMISSION_STATUSES
+    )
 
 
 def pipeline_summary(conn) -> dict:
@@ -974,11 +1251,7 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
     if remaining:
         unroutable = SETTLED_OK_SUBMISSION_STATUSES + POLLABLE_SUBMISSION_STATUSES
         latest_failed_submissions = conn.execute(
-            "SELECT sub.id, sub.scaffold_run_id, sub.status, sr.contract_id,"
-            " EXISTS ("
-            "   SELECT 1 FROM learning_events l"
-            "   WHERE l.scope_type = 'submission' AND l.scope_id = sub.id"
-            " ) AS has_learning"
+            "SELECT sub.id, sub.scaffold_run_id, sub.status, sr.contract_id"
             " FROM submissions sub"
             " JOIN ("
             "   SELECT scaffold_run_id, MAX(id) AS id"
@@ -992,14 +1265,9 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
         ).fetchall()
         for row in latest_failed_submissions:
             route = triage_route(row["status"])
-            action = (
-                f"synthtask scaffold start {row['contract_id']} --builder codex"
-                if row["has_learning"]
-                else (
-                    f"record learning for {row['status']} and start a revised "
-                    f"scaffold for contract #{row['contract_id']}"
-                )
-            )
+            # `record_submission` captures the failure automatically now, so the revision
+            # is always the next step rather than something gated on recording it first.
+            action = f"synthtask scaffold start {row['contract_id']} --builder codex"
             actions.append(
                 {
                     "stage": "triage",

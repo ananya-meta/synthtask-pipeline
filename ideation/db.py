@@ -640,6 +640,34 @@ def add_learning_event(conn: sqlite3.Connection, **kw: Any) -> int:
     return cur.lastrowid
 
 
+def learning_events_for(
+    conn: sqlite3.Connection, scope_type: str, scope_id: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM learning_events WHERE scope_type = ? AND scope_id = ?"
+        " ORDER BY created_at, id",
+        (scope_type, scope_id),
+    ).fetchall()
+
+
+def learning_events_for_contract(
+    conn: sqlite3.Connection, contract_id: int
+) -> list[sqlite3.Row]:
+    """Every learning event reachable from a contract, via its scaffolds and submissions."""
+    return conn.execute(
+        "SELECT l.* FROM learning_events l"
+        " WHERE (l.scope_type = 'contract' AND l.scope_id = ?)"
+        "    OR (l.scope_type = 'scaffold' AND l.scope_id IN ("
+        "          SELECT id FROM scaffold_runs WHERE contract_id = ?))"
+        "    OR (l.scope_type = 'submission' AND l.scope_id IN ("
+        "          SELECT sub.id FROM submissions sub"
+        "          JOIN scaffold_runs sr ON sr.id = sub.scaffold_run_id"
+        "          WHERE sr.contract_id = ?))"
+        " ORDER BY l.created_at, l.id",
+        (contract_id, contract_id, contract_id),
+    ).fetchall()
+
+
 # --- contract settings ----------------------------------------------------
 
 

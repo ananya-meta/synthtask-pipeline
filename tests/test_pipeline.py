@@ -48,6 +48,19 @@ def tearDownModule():
         _SCAFFOLD_SANDBOX.cleanup()
 
 
+# Realistic enough to clear `validate_contract`'s quality floor — terse placeholders are
+# exactly what that floor exists to reject.
+CONTRACT_FIXTURE = {
+    "hidden_principle": "Score concept transfer against held-out bridges the agent never sees.",
+    "allowed_inputs": '["visible graph snapshot", "public README"]',
+    "forbidden_leaks": '["held-out bridge list", "scoring thresholds"]',
+    "oracle_strategy": "Compare submitted rankings against a hidden implementation-independent oracle.",
+    "mutation_strategy": "Reject solvers that hard-code public examples or emit constant output.",
+    "infra_requirements": "stdlib Python.",
+    "difficulty_target": "Frontier agents should need graph reasoning and fail simple heuristics.",
+}
+
+
 def make_corpus(conn):
     seed_id = db.add_seed(
         conn, arxiv_id="0000.00001", slug="00-test-seed", title="Test Seed",
@@ -408,13 +421,7 @@ class TestLifecycle(unittest.TestCase):
         contract_id = lifecycle.create_contract(
             self.conn,
             self.idea_id,
-            hidden_principle="Hidden graph cases.",
-            allowed_inputs='["visible graph"]',
-            forbidden_leaks='["hidden graph"]',
-            oracle_strategy="Compare against hidden graph oracle.",
-            mutation_strategy="Reject constant outputs.",
-            infra_requirements="stdlib Python.",
-            difficulty_target="Not solved by a noop.",
+            **CONTRACT_FIXTURE,
         )
         with self.assertRaises(lifecycle.LifecycleError):
             lifecycle.start_scaffold(self.conn, contract_id, builder="codex")
@@ -445,13 +452,7 @@ class TestLifecycle(unittest.TestCase):
         contract_id = lifecycle.create_contract(
             self.conn,
             self.idea_id,
-            hidden_principle="Hidden graph cases.",
-            allowed_inputs='["visible graph"]',
-            forbidden_leaks='["hidden graph"]',
-            oracle_strategy="Compare against hidden graph oracle.",
-            mutation_strategy="Reject constant outputs.",
-            infra_requirements="stdlib Python.",
-            difficulty_target="Not solved by a noop.",
+            **CONTRACT_FIXTURE,
         )
         self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
         scaffold_id, _ = lifecycle.start_scaffold(self.conn, contract_id, builder="codex")
@@ -477,13 +478,7 @@ class TestLifecycle(unittest.TestCase):
         contract_id = lifecycle.create_contract(
             self.conn,
             self.idea_id,
-            hidden_principle="Hidden graph cases.",
-            allowed_inputs='["visible graph"]',
-            forbidden_leaks='["hidden graph"]',
-            oracle_strategy="Compare against hidden graph oracle.",
-            mutation_strategy="Reject constant outputs.",
-            infra_requirements="stdlib Python.",
-            difficulty_target="Not solved by a noop.",
+            **CONTRACT_FIXTURE,
         )
         self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
         scaffold_id, root = lifecycle.start_scaffold(self.conn, contract_id, builder="codex")
@@ -508,13 +503,7 @@ class TestLifecycle(unittest.TestCase):
         contract_id = lifecycle.create_contract(
             self.conn,
             self.idea_id,
-            hidden_principle="Hidden graph cases.",
-            allowed_inputs='["visible graph"]',
-            forbidden_leaks='["hidden graph"]',
-            oracle_strategy="Compare against hidden graph oracle.",
-            mutation_strategy="Reject constant outputs.",
-            infra_requirements="stdlib Python.",
-            difficulty_target="Not solved by a noop.",
+            **CONTRACT_FIXTURE,
         )
         self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
         scaffold_id, _ = lifecycle.start_scaffold(self.conn, contract_id)
@@ -538,16 +527,14 @@ class TestLifecycle(unittest.TestCase):
         action = lifecycle.next_actions(self.conn)[0]
         self.assertEqual(action["stage"], "triage")
         self.assertEqual(action["route"], "strengthen_oracle")
-
-        lifecycle.record_learning(
-            self.conn,
-            scope_type="submission",
-            scope_id=submission_id,
-            label="bad-grading-weak",
-            detail="tighten hidden oracle",
+        # The failure records itself now, so the revision is the next step directly rather
+        # than being gated behind a manual `learn add`.
+        self.assertEqual(
+            action["action"], f"synthtask scaffold start {contract_id} --builder codex"
         )
-        action = lifecycle.next_actions(self.conn)[0]
-        self.assertEqual(action["action"], f"synthtask scaffold start {contract_id} --builder codex")
+        auto = db.learning_events_for(self.conn, "submission", submission_id)
+        self.assertEqual([e["label"] for e in auto], ["smoldata-failure"])
+        self.assertEqual(json.loads(auto[0]["payload_json"])["route"], "strengthen_oracle")
 
     def test_next_actions_advance_from_accepted_idea_to_scaffold(self):
         db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
@@ -558,13 +545,7 @@ class TestLifecycle(unittest.TestCase):
         contract_id = lifecycle.create_contract(
             self.conn,
             self.idea_id,
-            hidden_principle="Hidden graph cases.",
-            allowed_inputs='["visible graph"]',
-            forbidden_leaks='["hidden graph"]',
-            oracle_strategy="Compare against hidden graph oracle.",
-            mutation_strategy="Reject constant outputs.",
-            infra_requirements="stdlib Python.",
-            difficulty_target="Not solved by a noop.",
+            **CONTRACT_FIXTURE,
         )
         self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
         second = lifecycle.next_actions(self.conn)
@@ -576,13 +557,7 @@ class TestLifecycle(unittest.TestCase):
         contract_id = lifecycle.create_contract(
             self.conn,
             self.idea_id,
-            hidden_principle="Hidden graph cases.",
-            allowed_inputs='["visible graph"]',
-            forbidden_leaks='["hidden graph"]',
-            oracle_strategy="Compare against hidden graph oracle.",
-            mutation_strategy="Reject constant outputs.",
-            infra_requirements="stdlib Python.",
-            difficulty_target="Not solved by a noop.",
+            **CONTRACT_FIXTURE,
         )
         self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
         scaffold_id, root = lifecycle.start_scaffold(self.conn, contract_id)
@@ -664,13 +639,7 @@ class TestPublisher(unittest.TestCase):
         contract_id = lifecycle.create_contract(
             self.conn,
             self.idea_id,
-            hidden_principle="Hidden semantic cases.",
-            allowed_inputs='["visible fixtures"]',
-            forbidden_leaks='["hidden oracle"]',
-            oracle_strategy="Run hidden oracle.",
-            mutation_strategy="Reject noop.",
-            infra_requirements="stdlib Python.",
-            difficulty_target="Not trivial.",
+            **CONTRACT_FIXTURE,
         )
         self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
         scaffold_id, root = lifecycle.start_scaffold(self.conn, contract_id)
@@ -818,15 +787,7 @@ class TestOrchestrator(unittest.TestCase):
         base = {
             "idea_id": self.idea_id,
             "stop_after": "scaffold",
-            "contract_overrides": {
-                "hidden_principle": "Hidden semantic cases.",
-                "allowed_inputs": '["visible fixtures"]',
-                "forbidden_leaks": '["hidden oracle"]',
-                "oracle_strategy": "Run hidden oracle.",
-                "mutation_strategy": "Reject noop.",
-                "infra_requirements": "stdlib Python.",
-                "difficulty_target": "Not trivial.",
-            },
+            "contract_overrides": dict(CONTRACT_FIXTURE),
         }
         base.update(kw)
         return orchestrator.PipelineRunConfig(**base)
@@ -848,13 +809,7 @@ class TestOrchestrator(unittest.TestCase):
         contract_id = lifecycle.create_contract(
             self.conn,
             self.idea_id,
-            hidden_principle="Hidden semantic cases.",
-            allowed_inputs='["visible fixtures"]',
-            forbidden_leaks='["hidden oracle"]',
-            oracle_strategy="Run hidden oracle.",
-            mutation_strategy="Reject noop.",
-            infra_requirements="stdlib Python.",
-            difficulty_target="Not trivial.",
+            **CONTRACT_FIXTURE,
         )
         self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
         scaffold_id, root = lifecycle.start_scaffold(self.conn, contract_id)
@@ -893,13 +848,7 @@ class TestOrchestrator(unittest.TestCase):
         contract_id = lifecycle.create_contract(
             self.conn,
             self.idea_id,
-            hidden_principle="Hidden semantic cases.",
-            allowed_inputs='["visible fixtures"]',
-            forbidden_leaks='["hidden oracle"]',
-            oracle_strategy="Run hidden oracle.",
-            mutation_strategy="Reject noop.",
-            infra_requirements="stdlib Python.",
-            difficulty_target="Not trivial.",
+            **CONTRACT_FIXTURE,
         )
         self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
         scaffold_id, root = lifecycle.start_scaffold(self.conn, contract_id)
@@ -992,17 +941,6 @@ class TestSmoldata(unittest.TestCase):
         self.assertEqual(result["returncode"], 1)
 
 
-CONTRACT_FIXTURE = {
-    "hidden_principle": "Hidden graph cases.",
-    "allowed_inputs": '["visible graph"]',
-    "forbidden_leaks": '["hidden graph"]',
-    "oracle_strategy": "Compare against hidden graph oracle.",
-    "mutation_strategy": "Reject constant outputs.",
-    "infra_requirements": "stdlib Python.",
-    "difficulty_target": "Not solved by a noop.",
-}
-
-
 class TestUnsettledSubmissions(unittest.TestCase):
     """A submission row is written the moment a task is published, so anything that is
     not yet a verdict has to stay visible or the task drops out of the controller."""
@@ -1016,7 +954,11 @@ class TestUnsettledSubmissions(unittest.TestCase):
             self.conn,
             self.runs["codex"],
             self.seed_id,
-            {"title": "pollable", "statement": "s", "assumption_broken": "a"},
+            {
+                "title": "pollable",
+                "statement": "Rank citation bridges whose support shifts under concept drift.",
+                "assumption_broken": "a",
+            },
         )
         db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
         self.contract_id = lifecycle.create_contract(
@@ -1094,7 +1036,11 @@ class TestFanoutGuards(unittest.TestCase):
             self.conn,
             self.runs["codex"],
             self.seed_id,
-            {"title": "guarded", "statement": "s", "assumption_broken": "a"},
+            {
+                "title": "guarded",
+                "statement": "Reconcile duplicate contracts across a shared idea corpus.",
+                "assumption_broken": "a",
+            },
         )
         db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
 
@@ -1152,7 +1098,11 @@ class TestContractSettings(unittest.TestCase):
             self.conn,
             self.runs["codex"],
             self.seed_id,
-            {"title": "configured", "statement": "s", "assumption_broken": "a"},
+            {
+                "title": "configured",
+                "statement": "Materialise a causal split without leaking the holdout partition.",
+                "assumption_broken": "a",
+            },
         )
         db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
         self.contract_id = lifecycle.create_contract(
@@ -1240,7 +1190,11 @@ class TestSweep(unittest.TestCase):
             self.conn,
             self.runs["codex"],
             self.seed_id,
-            {"title": "sweepable", "statement": "s", "assumption_broken": "a"},
+            {
+                "title": "sweepable",
+                "statement": "Detect stale validation state across a queue of published tasks.",
+                "assumption_broken": "a",
+            },
         )
         db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
         self.contract_id = lifecycle.create_contract(
@@ -1353,6 +1307,359 @@ class TestSweep(unittest.TestCase):
             with self.assertRaises(sweep.SweepError):
                 with sweep.exclusive_lock(lock_path):
                     pass
+
+
+class TestBuildGate(unittest.TestCase):
+    """The build gate must be stated as an exclusion list.
+
+    `scaffold_runs.state` takes fifteen values from seven writers; an allowlist of "already
+    built" states silently omits new ones and re-invokes the builder on finished work.
+    """
+
+    ALL_STATES = (
+        "started", "running", "built", "build_failed", "verified", "verification_failed",
+        "reviewed", "needs_revision", "rejected", "promoted", "published", "no_changes",
+        "committed", "submitted", "accepted",
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conn = db.connect(Path(self.tmp.name) / "t.db")
+        self.seed_id, self.runs = make_corpus(self.conn)
+        self.idea_id = db.add_idea(
+            self.conn,
+            self.runs["codex"],
+            self.seed_id,
+            {
+                "title": "gated",
+                "statement": "Rebuild a published scaffold only when it has no build behind it.",
+                "assumption_broken": "a",
+            },
+        )
+        db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
+        self.contract_id = lifecycle.create_contract(
+            self.conn, self.idea_id, **CONTRACT_FIXTURE
+        )
+        self.assertEqual(lifecycle.mark_contract_ready(self.conn, self.contract_id), [])
+        self.scaffold_id, _ = lifecycle.start_scaffold(self.conn, self.contract_id)
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def _rebuilds_from(self, state: str) -> bool:
+        db.update_scaffold_run(self.conn, self.scaffold_id, state=state)
+        with mock.patch.object(lifecycle, "run_scaffold_worker", return_value=0) as worker:
+            orchestrator.run(
+                self.conn,
+                orchestrator.PipelineRunConfig(
+                    scaffold_run_id=self.scaffold_id, stop_after="build"
+                ),
+            )
+        return worker.called
+
+    def test_only_unbuilt_states_invoke_the_builder(self):
+        for state in self.ALL_STATES:
+            with self.subTest(state=state):
+                expected = state in lifecycle.UNBUILT_STATES
+                self.assertEqual(
+                    self._rebuilds_from(state),
+                    expected,
+                    f"state {state!r} should{'' if expected else ' not'} trigger a build",
+                )
+
+    def test_published_scaffold_is_never_rebuilt(self):
+        for state in ("published", "no_changes", "committed"):
+            with self.subTest(state=state):
+                self.assertFalse(self._rebuilds_from(state))
+
+
+class TestFailureClassification(unittest.TestCase):
+    def _payload(self, **detail) -> dict:
+        return {
+            "status": "draft",
+            "validationStatus": "failed",
+            "validationDetails": [
+                {"label": "Structural checks", "status": "passed", "detail": "14/14"},
+                {"label": "Metacode or Opus pass/fail balance", "status": "failed", **detail},
+            ],
+        }
+
+    def test_structured_code_beats_prose(self):
+        # Prose says one thing, the machine field says another: trust the field.
+        payload = self._payload(detail="Timeout while grading", monotoneFailure="too-easy")
+        self.assertEqual(smoldata._status_from_payload(payload), "too_easy")
+
+    def test_real_codimango_shape(self):
+        payload = self._payload(
+            detail="Too easy — avocado passed all 5 (avocado: 5/5, opus: 5/5)",
+            monotoneFailure="too-easy",
+        )
+        self.assertEqual(smoldata._status_from_payload(payload), "too_easy")
+
+    def test_prose_fallback_when_no_code(self):
+        payload = self._payload(detail="Too easy — avocado passed all 5")
+        self.assertEqual(smoldata._status_from_payload(payload), "too_easy")
+
+    def test_unknown_code_is_surfaced_not_dropped(self):
+        payload = self._payload(detail="something new", monotoneFailure="wildly-new-code")
+        status = smoldata._status_from_payload(payload)
+        self.assertEqual(status, "failed_unclassified:wildly_new_code")
+        self.assertEqual(lifecycle.triage_route(status), "manual_triage")
+
+    def test_unclassifiable_failure_is_distinct_from_rejection(self):
+        payload = self._payload(detail="the grader emitted an unfamiliar complaint")
+        status = smoldata._status_from_payload(payload)
+        self.assertEqual(status, "failed_unclassified")
+        self.assertNotEqual(status, "rejected")
+        self.assertTrue(lifecycle.is_failed_status(status))
+
+    def test_unclassified_failure_still_routes_to_triage_not_poll(self):
+        self.assertFalse(
+            "failed_unclassified" in lifecycle.POLLABLE_SUBMISSION_STATUSES
+        )
+        self.assertTrue(lifecycle.is_failed_status("failed_unclassified"))
+
+
+class TestContractQualityFloor(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conn = db.connect(Path(self.tmp.name) / "t.db")
+        self.seed_id, self.runs = make_corpus(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def _contract(self, statement: str, **overrides) -> int:
+        idea_id = db.add_idea(
+            self.conn,
+            self.runs["codex"],
+            self.seed_id,
+            {"title": "t", "statement": statement, "assumption_broken": "a"},
+        )
+        db.add_verdict(self.conn, idea_id, "accept", "ACCEPT")
+        fields = dict(CONTRACT_FIXTURE)
+        fields.update(overrides)
+        return lifecycle.create_contract(self.conn, idea_id, **fields)
+
+    def test_realistic_contract_passes(self):
+        cid = self._contract("Materialise a causal split without leaking the holdout.")
+        self.assertEqual(lifecycle.mark_contract_ready(self.conn, cid), [])
+
+    def test_filler_is_rejected(self):
+        cid = self._contract(
+            "Materialise a causal split without leaking the holdout.",
+            hidden_principle="asdf",
+        )
+        self.assertIn("hidden_principle:placeholder", lifecycle.mark_contract_ready(self.conn, cid))
+
+    def test_terse_prose_is_rejected(self):
+        cid = self._contract(
+            "Materialise a causal split without leaking the holdout.",
+            oracle_strategy="run oracle",
+        )
+        self.assertIn("oracle_strategy:too_short", lifecycle.mark_contract_ready(self.conn, cid))
+
+    def test_placeholder_list_entries_are_rejected(self):
+        cid = self._contract(
+            "Materialise a causal split without leaking the holdout.",
+            forbidden_leaks='["TBD", "n/a"]',
+        )
+        self.assertIn("forbidden_leaks:placeholder", lifecycle.mark_contract_ready(self.conn, cid))
+
+    def test_forbidden_leaks_cannot_equal_allowed_inputs(self):
+        cid = self._contract(
+            "Materialise a causal split without leaking the holdout.",
+            allowed_inputs='["the hidden oracle"]',
+            forbidden_leaks='["the hidden oracle"]',
+        )
+        self.assertIn(
+            "forbidden_leaks:same_as_allowed_inputs",
+            lifecycle.mark_contract_ready(self.conn, cid),
+        )
+
+    def test_infra_requirements_may_be_terse(self):
+        cid = self._contract(
+            "Materialise a causal split without leaking the holdout.",
+            infra_requirements="stdlib Python.",
+        )
+        self.assertEqual(lifecycle.mark_contract_ready(self.conn, cid), [])
+
+    def test_a_rejected_contract_cannot_be_scaffolded(self):
+        cid = self._contract(
+            "Materialise a causal split without leaking the holdout.",
+            hidden_principle="tbd",
+        )
+        self.assertTrue(lifecycle.mark_contract_ready(self.conn, cid))
+        with self.assertRaises(lifecycle.LifecycleError):
+            lifecycle.start_scaffold(self.conn, cid)
+
+
+class TestRevisionMemory(unittest.TestCase):
+    """Revision N must be able to see why revisions 1..N-1 failed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.conn = db.connect(self.root / "t.db")
+        self.seed_id, self.runs = make_corpus(self.conn)
+        self.idea_id = db.add_idea(
+            self.conn,
+            self.runs["codex"],
+            self.seed_id,
+            {
+                "title": "revisable",
+                "statement": "Materialise a causal split without leaking the holdout partition.",
+                "assumption_broken": "a",
+            },
+        )
+        db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
+        self.contract_id = lifecycle.create_contract(
+            self.conn, self.idea_id, **CONTRACT_FIXTURE
+        )
+        self.assertEqual(lifecycle.mark_contract_ready(self.conn, self.contract_id), [])
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def _failed_revision(self, status: str = "too_easy") -> int:
+        scaffold_id, _ = lifecycle.start_scaffold(self.conn, self.contract_id)
+        lifecycle.record_submission(
+            self.conn,
+            scaffold_id,
+            platform="smoldata",
+            external_id="causal-split",
+            status=status,
+            result={
+                "watch": {
+                    "task": {
+                        "validationDetails": [
+                            {
+                                "label": "Metacode or Opus pass/fail balance",
+                                "status": "failed",
+                                "detail": "Too easy — avocado passed all 5",
+                            }
+                        ]
+                    }
+                }
+            },
+        )
+        return scaffold_id
+
+    def test_first_revision_has_no_history(self):
+        self.assertEqual(lifecycle.prior_attempts(self.conn, self.contract_id), [])
+        _, root = lifecycle.start_scaffold(self.conn, self.contract_id)
+        text = (root / "PRIOR_ATTEMPTS.md").read_text()
+        self.assertIn("No prior attempts", text)
+
+    def test_second_revision_sees_the_first_failure(self):
+        self._failed_revision()
+        _, root = lifecycle.start_scaffold(self.conn, self.contract_id)
+
+        text = (root / "PRIOR_ATTEMPTS.md").read_text()
+        self.assertIn("Revision 1", text)
+        self.assertIn("too_easy", text)
+        self.assertIn("reduce_leakage_or_add_hidden_state", text)
+        self.assertIn("avocado passed all 5", text)
+
+    def test_third_revision_sees_both(self):
+        self._failed_revision()
+        self._failed_revision()
+        attempts = lifecycle.prior_attempts(self.conn, self.contract_id)
+        self.assertEqual([a["revision"] for a in attempts], [1, 2])
+
+        _, root = lifecycle.start_scaffold(self.conn, self.contract_id)
+        text = (root / "PRIOR_ATTEMPTS.md").read_text()
+        self.assertIn("Revision 1", text)
+        self.assertIn("Revision 2", text)
+        self.assertIn("2 prior attempt(s)", text)
+
+    def test_history_excludes_the_revision_being_created(self):
+        self._failed_revision()
+        _, root = lifecycle.start_scaffold(self.conn, self.contract_id)
+        self.assertNotIn("Revision 2", (root / "PRIOR_ATTEMPTS.md").read_text())
+
+    def test_prior_attempts_reach_the_builder_prompt(self):
+        self._failed_revision()
+        scaffold_id, root = lifecycle.start_scaffold(
+            self.conn, self.contract_id, builder="codex"
+        )
+        prompt_file = self.root / "build_prompt.md"
+        prompt_file.write_text("Build in {{TASK_DIR}}\n\n{{PRIOR_ATTEMPTS}}\n")
+
+        completed = subprocess.CompletedProcess(["codex"], 0, stdout="", stderr="")
+        with mock.patch.object(lifecycle.subprocess, "run", return_value=completed):
+            lifecycle.run_scaffold_worker(self.conn, scaffold_id, prompt_file, timeout=30)
+
+        rendered = (root / "RUN_PROMPT.md").read_text()
+        self.assertIn("too_easy", rendered)
+        self.assertIn("reduce_leakage_or_add_hidden_state", rendered)
+
+    def test_revision_refuses_a_prompt_that_ignores_history(self):
+        self._failed_revision()
+        scaffold_id, _ = lifecycle.start_scaffold(
+            self.conn, self.contract_id, builder="codex"
+        )
+        blind = self.root / "blind_prompt.md"
+        blind.write_text("Build in {{TASK_DIR}}\n")
+
+        with mock.patch.object(lifecycle.subprocess, "run") as run:
+            with self.assertRaises(lifecycle.LifecycleError) as caught:
+                lifecycle.run_scaffold_worker(self.conn, scaffold_id, blind, timeout=30)
+        run.assert_not_called()
+        self.assertIn("PRIOR_ATTEMPTS", str(caught.exception))
+
+    def test_first_revision_may_ignore_history(self):
+        scaffold_id, _ = lifecycle.start_scaffold(
+            self.conn, self.contract_id, builder="codex"
+        )
+        blind = self.root / "blind_prompt.md"
+        blind.write_text("Build in {{TASK_DIR}}\n")
+        completed = subprocess.CompletedProcess(["codex"], 0, stdout="", stderr="")
+        with mock.patch.object(lifecycle.subprocess, "run", return_value=completed):
+            rc = lifecycle.run_scaffold_worker(self.conn, scaffold_id, blind, timeout=30)
+        self.assertEqual(rc, 0)
+
+    def test_prior_attempts_file_does_not_break_isolation(self):
+        self._failed_revision()
+        _, root = lifecycle.start_scaffold(self.conn, self.contract_id)
+        lifecycle.assert_scaffold_isolated(root)  # must not raise
+
+    def test_human_learning_notes_reach_the_next_revision(self):
+        scaffold_id = self._failed_revision()
+        submission_id = self.conn.execute(
+            "SELECT id FROM submissions WHERE scaffold_run_id = ?", (scaffold_id,)
+        ).fetchone()["id"]
+        lifecycle.record_learning(
+            self.conn,
+            scope_type="submission",
+            scope_id=submission_id,
+            label="human-note",
+            detail="the public fixtures already contain the holdout split",
+        )
+        _, root = lifecycle.start_scaffold(self.conn, self.contract_id)
+        self.assertIn(
+            "public fixtures already contain the holdout split",
+            (root / "PRIOR_ATTEMPTS.md").read_text(),
+        )
+
+    def test_revision_guidance_is_omitted_until_written(self):
+        # `prompts/` is human-authored; the harness stays silent when the file is absent
+        # or still a placeholder, rather than inventing guidance.
+        missing = self.root / "nope.md"
+        with mock.patch.object(lifecycle.db, "REPO_ROOT", missing):
+            self.assertEqual(lifecycle.revision_guidance(), "")
+
+        fake_repo = self.root / "repo"
+        (fake_repo / "prompts").mkdir(parents=True)
+        guidance = fake_repo / "prompts" / "revision_guidance.md"
+        guidance.write_text("<!-- TODO: write this -->\n")
+        with mock.patch.object(lifecycle.db, "REPO_ROOT", fake_repo):
+            self.assertEqual(lifecycle.revision_guidance(), "")
+            guidance.write_text("On too_easy: add hidden state.\n")
+            self.assertIn("add hidden state", lifecycle.revision_guidance())
 
 
 if __name__ == "__main__":

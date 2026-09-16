@@ -56,6 +56,16 @@ shapes what tasks come out. Harness code is fine.
    it records a result, so anything unsettled has to stay visible in `next_actions` —
    see `lifecycle.POLLABLE_SUBMISSION_STATUSES`. A task that silently falls out of
    `next_actions` is a task nobody is tracking.
+9. **State gates are exclusion lists.** `scaffold_runs.state` takes fifteen values written
+   by seven call sites. Any gate phrased as "these states mean done" silently omits states
+   added later — that is how a published scaffold came to be rebuilt. See
+   `lifecycle.UNBUILT_STATES`, and prefer `is_failed_status()` over enumerating failures.
+10. **A revision must see the attempts it replaces.** `PRIOR_ATTEMPTS.md` and the
+    `{{PRIOR_ATTEMPTS}}` token exist because revisions were built from byte-identical
+    inputs to the attempts that already failed. `run_scaffold_worker` refuses a revision
+    whose prompt drops the token. The harness threads *evidence* — statuses, routes,
+    reviewer prose, human notes — never generated advice about how to fix a task; that
+    would shape task content and belongs in human-authored `prompts/`.
 
 ## Layout
 

@@ -201,11 +201,10 @@ def run(conn, config: PipelineRunConfig) -> PipelineRunResult:
 
     if should_continue("build"):
         scaffold = db.get_scaffold_run(conn, scaffold_run_id)
-        built_states = {"built", "verified", "reviewed", "promoted", "submitted", "accepted"}
         build_prompt_file = config.build_prompt_file
         if build_prompt_file is None and DEFAULT_BUILD_PROMPT.exists():
             build_prompt_file = DEFAULT_BUILD_PROMPT
-        if scaffold is not None and scaffold["state"] in built_states:
+        if scaffold is not None and scaffold["state"] not in lifecycle.UNBUILT_STATES:
             result.completed.append("build")
         elif not config.allow_build:
             return _blocked(

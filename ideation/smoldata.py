@@ -87,6 +87,52 @@ def _string_value(payload: dict, key: str) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+# Codimango tags a failing validation detail with a machine-readable `monotoneFailure`
+# next to the human prose. Reading the field first means a reworded message can no longer
+# silently reclassify a failure.
+MONOTONE_FAILURES = {
+    "too_easy": "too_easy",
+    "too_hard": "too_hard",
+    "bad_grading_weak": "bad_grading_weak",
+    "weak_grading": "bad_grading_weak",
+    "grading_wrong": "grading_wrong",
+    "leak": "leak",
+    "timeout": "timeout",
+    "infra": "infra_error",
+    "infra_error": "infra_error",
+}
+
+PROSE_FAILURES = (
+    ("too easy", "too_easy"),
+    ("bad_grading_weak", "bad_grading_weak"),
+    ("bad grading weak", "bad_grading_weak"),
+    ("weak grading", "bad_grading_weak"),
+    ("grading wrong", "grading_wrong"),
+    ("too hard", "too_hard"),
+    ("leak", "leak"),
+    ("timeout", "timeout"),
+    ("infra", "infra_error"),
+)
+
+# An unclassifiable failure must not look like a deliberate rejection, otherwise a change
+# to Codimango's vocabulary funnels every failure into the same dead end unnoticed.
+UNCLASSIFIED_FAILURE = "failed_unclassified"
+
+
+def _monotone_failure(items: list) -> str:
+    for item in items:
+        raw = item.get("monotoneFailure")
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        normalized = raw.strip().lower().replace("-", "_")
+        mapped = MONOTONE_FAILURES.get(normalized)
+        if mapped:
+            return mapped
+        # An unrecognised code is still a signal; carry it rather than dropping it.
+        return f"{UNCLASSIFIED_FAILURE}:{normalized}"
+    return ""
+
+
 def _failure_status_from_details(payload: dict) -> str:
     details = payload.get("validationDetails")
     if not isinstance(details, list):
@@ -99,25 +145,19 @@ def _failure_status_from_details(payload: dict) -> str:
     ]
     if not failed_details:
         failed_details = [item for item in details if isinstance(item, dict)]
+
+    coded = _monotone_failure(failed_details)
+    if coded:
+        return coded
+
     text = " ".join(
         " ".join(str(item.get(key, "")) for key in ("label", "status", "detail"))
         for item in failed_details
     ).lower()
-    patterns = (
-        ("too easy", "too_easy"),
-        ("bad_grading_weak", "bad_grading_weak"),
-        ("bad grading weak", "bad_grading_weak"),
-        ("weak grading", "bad_grading_weak"),
-        ("grading wrong", "grading_wrong"),
-        ("too hard", "too_hard"),
-        ("leak", "leak"),
-        ("timeout", "timeout"),
-        ("infra", "infra_error"),
-    )
-    for needle, status in patterns:
+    for needle, status in PROSE_FAILURES:
         if needle in text:
             return status
-    return ""
+    return UNCLASSIFIED_FAILURE if failed_details else ""
 
 
 def show_task(task_name: str, *, site: str = "default", timeout: int = 900) -> dict:

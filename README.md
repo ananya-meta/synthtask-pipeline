@@ -102,7 +102,8 @@ synthtask contract create 42 \
   --infra-requirement "stdlib Python verifier inside the task image" \
   --difficulty-target "frontier agents should need multiple attempts"
 
-# 3. mark complete contracts ready
+# 3. mark complete contracts ready — refuses placeholders, terse prose, and a
+# forbidden_leaks list that merely repeats allowed_inputs
 synthtask contract ready 1
 
 # 4. create an isolated scaffold workspace
@@ -155,15 +156,43 @@ synthtask pipeline run \
 ```
 
 Passing only `--scaffold-run-id` is enough to resume an existing task: the contract is
-looked up from the scaffold, and `build`/`verify`/`promote`/`publish` each skip work that
-is already done, so re-running is safe. `--no-build` blocks at `build` rather than
-invoking a builder on an unbuilt scaffold.
+looked up from the scaffold, and `build`/`verify`/`promote`/`publish` each skip work that is
+already done. The build gate is an exclusion list — only `started`, `running` and
+`build_failed` mean "no build behind this workspace" — so resuming a published scaffold
+cannot re-invoke the builder. `--no-build` blocks at `build` outright.
 
 Contracts, by contrast, are not re-entrant: drafting a second contract for an idea that
 already has a live one, or starting a second scaffold for a contract that already has a
 live one, is refused. Use `--force` / `--revision` when that is genuinely what you want —
 the revision loop after a Smoldata rejection still works, because a `submitted` scaffold
 is no longer live.
+
+## Revisions Carry Their History
+
+A revision used to be built from byte-identical inputs to the attempt it was replacing, so a
+task rejected as `too_easy` twice got rebuilt a third time with no encoding of why.
+
+`synthtask scaffold start` now writes `PRIOR_ATTEMPTS.md` into every workspace: per revision,
+the builder used, local verification outcomes, reviewer verdicts, the Codimango status and
+its triage route, and any learning notes attached to that submission. Failures record
+themselves — `record_submission` writes a `smoldata-failure` learning event carrying the
+status, the route, and the reviewer's own prose — so the history is populated without a
+manual `learn add`. Your own `learn add` notes appear alongside it.
+
+Two prompt tokens expose this to the builder:
+
+| Token | Replaced with |
+|---|---|
+| `{{PRIOR_ATTEMPTS}}` | rendered `PRIOR_ATTEMPTS.md` for this contract |
+| `{{REVISION_GUIDANCE}}` | `prompts/revision_guidance.md`, if you write one |
+
+Both are optional for a first revision. **From revision 2 onward, `scaffold run` refuses a
+prompt with no `{{PRIOR_ATTEMPTS}}` token** rather than silently rebuilding blind. Add the
+token to `prompts/build_task.md` to enable it.
+
+`prompts/revision_guidance.md` does not exist yet and is yours to write — it is the place to
+say what a `too_easy` or `bad_grading_weak` route should actually change. The harness threads
+it in when the file exists and is not a `<!-- TODO` placeholder, and stays silent otherwise.
 
 ## Unattended Sweeps
 
@@ -235,10 +264,17 @@ clone or GitHub API fallback, so it does not modify a dirty benchmark checkout.
 
 Smoldata feedback is mapped into controller routing:
 
+Failure classification reads Codimango's machine-readable `monotoneFailure` field first and
+falls back to matching the prose. A failure that neither path recognises becomes
+`failed_unclassified` (or `failed_unclassified:<code>` for an unknown machine code) rather
+than being flattened into `rejected` — so a change in Codimango's vocabulary shows up as a
+new status instead of silently looking like a deliberate rejection.
+
 | Smoldata signal | Pipeline route |
 |---|---|
 | `accepted` | done |
 | `pending` / `published` / `draft` / `unknown` | poll again |
+| `failed_unclassified` | manual triage — classification needs updating |
 | `infra` / `infra_error` | fix Docker/runtime/artifacts |
 | `bad_grading_weak` | strengthen hidden oracle and mutation tests |
 | `grading_wrong` | fix verifier contract |
