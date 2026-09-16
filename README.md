@@ -15,8 +15,7 @@ instead of memory.
 ## Why ideation
 
 Ideation is the track's stated #1 known challenge — *"models tend to produce similar ideas
-regardless of seed"* — and the stage where human attention has the highest marginal return
-(Adhi: human-in-the-loop at ideation raises accepted-task yield). It is also the only stage
+regardless of seed"* — and the stage where human attention has the highest marginal return. It is also the only stage
 cheap enough to iterate on: a scaffold round-trip is hours, an ideation round-trip is minutes.
 
 The differentiator is not that it generates ideas — everyone's pipeline does. It is that
