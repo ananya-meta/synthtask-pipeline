@@ -59,6 +59,7 @@ class PipelineRunConfig:
     stop_after: str = "learn"
     force_contract: bool = False
     allow_draft_scaffold: bool = False
+    allow_build: bool = True
     contract_overrides: dict[str, str] = field(default_factory=dict)
 
 
@@ -87,6 +88,40 @@ def parse_command(value: str) -> list[str]:
     return command
 
 
+def apply_contract_settings(conn, contract_id: int, config: PipelineRunConfig) -> None:
+    """Fill unset config fields from the contract's stored settings.
+
+    Explicit flags always win; this only supplies what the caller left blank, which is
+    what lets an unattended sweep advance a task with no per-task arguments.
+    """
+    row = db.get_contract_settings(conn, contract_id)
+    if row is None:
+        return
+
+    if not config.verify_commands and row["verify_commands"]:
+        try:
+            stored = json.loads(row["verify_commands"])
+        except json.JSONDecodeError as exc:
+            raise OrchestratorError(
+                f"contract #{contract_id} has invalid verify_commands JSON"
+            ) from exc
+        config.verify_commands = [parse_command(cmd) for cmd in stored]
+
+    if config.canonical_root is None and row["canonical_root"]:
+        config.canonical_root = Path(row["canonical_root"])
+
+    for attr in ("publish_task_name", "publish_remote", "source_repo"):
+        if not getattr(config, attr) and row[attr]:
+            setattr(config, attr, row[attr])
+
+    if config.publish_branch == publisher.DEFAULT_BRANCH and row["publish_branch"]:
+        config.publish_branch = row["publish_branch"]
+    if config.publish_method == "auto" and row["publish_method"]:
+        config.publish_method = row["publish_method"]
+    if config.smoldata_site == "default" and row["smoldata_site"]:
+        config.smoldata_site = row["smoldata_site"]
+
+
 def run(conn, config: PipelineRunConfig) -> PipelineRunResult:
     if config.stop_after not in STAGES:
         raise OrchestratorError(f"unknown stop stage {config.stop_after!r}")
@@ -98,6 +133,17 @@ def run(conn, config: PipelineRunConfig) -> PipelineRunResult:
         return STAGES.index(stage) <= target_index
 
     contract_id = config.contract_id
+    if contract_id is None and config.scaffold_run_id is not None:
+        scaffold = db.get_scaffold_run(conn, config.scaffold_run_id)
+        if scaffold is None:
+            return _blocked(
+                result,
+                "contract",
+                f"no scaffold run #{config.scaffold_run_id}",
+                "synthtask scaffold list",
+            )
+        contract_id = scaffold["contract_id"]
+
     if should_continue("contract") and contract_id is None:
         if config.idea_id is None:
             return _blocked(result, "contract", "missing idea or contract", "pass --idea-id or --contract-id")
@@ -117,6 +163,7 @@ def run(conn, config: PipelineRunConfig) -> PipelineRunResult:
     if contract_id is None:
         return result
     result.ids.setdefault("contract_id", contract_id)
+    apply_contract_settings(conn, contract_id, config)
 
     if should_continue("ready"):
         try:
@@ -160,6 +207,13 @@ def run(conn, config: PipelineRunConfig) -> PipelineRunResult:
             build_prompt_file = DEFAULT_BUILD_PROMPT
         if scaffold is not None and scaffold["state"] in built_states:
             result.completed.append("build")
+        elif not config.allow_build:
+            return _blocked(
+                result,
+                "build",
+                "scaffold is not built and this run may not invoke a builder",
+                f"synthtask scaffold run {scaffold_run_id} --prompt-file {DEFAULT_BUILD_PROMPT}",
+            )
         elif build_prompt_file is None:
             return _blocked(
                 result,

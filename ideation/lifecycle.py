@@ -52,6 +52,8 @@ TRIAGE_ROUTE = {
     "accepted": "done",
     "pending": "poll",
     "published": "poll",
+    "draft": "poll",
+    "unknown": "poll",
     "infra": "fix_infra",
     "infra_error": "fix_infra",
     "bad_grading_weak": "strengthen_oracle",
@@ -63,9 +65,31 @@ TRIAGE_ROUTE = {
     "rejected": "triage_feedback",
 }
 
+# Codimango has not reached a verdict yet. These must stay visible to the controller:
+# a submission row is written as soon as the task is published, so without a re-poll
+# stage the task would silently drop out of next_actions forever.
+POLLABLE_SUBMISSION_STATUSES = ("pending", "published", "draft", "unknown")
+SETTLED_OK_SUBMISSION_STATUSES = ("accepted", "passed")
+
+# A contract in one of these states already owns the idea; drafting a second one just
+# fans out duplicate versions. Same idea for scaffolds: anything outside the
+# restartable set is still live, so a new revision would race it.
+CONTRACT_LIVE_STATES = ("draft", "ready")
+SCAFFOLD_RESTARTABLE_STATES = (
+    "build_failed",
+    "needs_revision",
+    "rejected",
+    "submitted",
+    "accepted",
+)
+
 
 class LifecycleError(RuntimeError):
     pass
+
+
+def _marks(values: tuple[str, ...]) -> str:
+    return ", ".join("?" for _ in values)
 
 
 def _now_ts() -> str:
@@ -192,6 +216,19 @@ def create_contract(
         raise LifecycleError(
             f"idea #{idea_id} is not accepted; pass --force to draft a contract anyway"
         )
+
+    if not force:
+        live = conn.execute(
+            "SELECT id, status FROM task_contracts WHERE idea_id = ?"
+            f" AND status IN ({_marks(CONTRACT_LIVE_STATES)})"
+            " ORDER BY version DESC LIMIT 1",
+            (idea_id, *CONTRACT_LIVE_STATES),
+        ).fetchone()
+        if live is not None:
+            raise LifecycleError(
+                f"idea #{idea_id} already has {live['status']} contract #{live['id']};"
+                " shelve it or pass --force to draft another version"
+            )
 
     raw = json.loads(idea["raw_json"] or "{}")
     default_objective = idea["statement"]
@@ -332,6 +369,17 @@ def start_scaffold(
         raise LifecycleError(f"contract #{contract_id} has terminal status {row['status']!r}")
 
     if revision is None:
+        live = conn.execute(
+            "SELECT id, state FROM scaffold_runs WHERE contract_id = ?"
+            f" AND state NOT IN ({_marks(SCAFFOLD_RESTARTABLE_STATES)})"
+            " ORDER BY revision DESC LIMIT 1",
+            (contract_id, *SCAFFOLD_RESTARTABLE_STATES),
+        ).fetchone()
+        if live is not None:
+            raise LifecycleError(
+                f"contract #{contract_id} already has live scaffold #{live['id']}"
+                f" in state {live['state']!r}; pass --revision to start another anyway"
+            )
         prior = conn.execute(
             "SELECT MAX(revision) AS r FROM scaffold_runs WHERE contract_id = ?",
             (contract_id,),
@@ -765,6 +813,7 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
                     "target": f"scaffold:{row['id']}",
                     "action": f"synthtask verify run {row['id']} --cwd task -- <command>",
                     "reason": "scaffold has no passing verification",
+                    "scaffold_run_id": row["id"],
                     "contract_id": row["contract_id"],
                 }
             )
@@ -794,6 +843,7 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
                     "target": f"scaffold:{row['id']}",
                     "action": f"synthtask audit record {row['id']} --reviewer <name> --verdict approve",
                     "reason": "verified scaffold has no approving adversarial review",
+                    "scaffold_run_id": row["id"],
                     "contract_id": row["contract_id"],
                 }
             )
@@ -820,6 +870,7 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
                     "target": f"scaffold:{row['id']}",
                     "action": f"synthtask scaffold promote {row['id']} /path/to/canonical-task-root",
                     "reason": "approved scaffold has not been promoted to canonical task bytes",
+                    "scaffold_run_id": row["id"],
                     "contract_id": row["contract_id"],
                 }
             )
@@ -845,6 +896,7 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
                     "target": f"scaffold:{row['id']}",
                     "action": f"synthtask publish run {row['id']} --task-name <task-name>",
                     "reason": "approved scaffold has not been published to the task repo",
+                    "scaffold_run_id": row["id"],
                     "contract_id": row["contract_id"],
                 }
             )
@@ -852,13 +904,14 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
     remaining = max(limit - len(actions), 0)
     if remaining:
         published_without_submission = conn.execute(
-            "SELECT p.scaffold_run_id, p.task_name FROM publish_records p"
+            "SELECT p.scaffold_run_id, p.task_name, sr.contract_id FROM publish_records p"
             " JOIN ("
             "   SELECT scaffold_run_id, MAX(id) AS id"
             "   FROM publish_records"
             "   WHERE status IN ('published', 'no_changes')"
             "   GROUP BY scaffold_run_id"
             " ) latest ON latest.id = p.id"
+            " JOIN scaffold_runs sr ON sr.id = p.scaffold_run_id"
             " WHERE NOT EXISTS (SELECT 1 FROM submissions sub WHERE sub.scaffold_run_id = p.scaffold_run_id)"
             " ORDER BY p.created_at DESC, p.id DESC LIMIT ?",
             (remaining,),
@@ -870,11 +923,56 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
                     "target": f"scaffold:{row['scaffold_run_id']}",
                     "action": f"synthtask smoldata watch {row['task_name']} --scaffold-run-id {row['scaffold_run_id']}",
                     "reason": "published task has no recorded Codimango validation result",
+                    "scaffold_run_id": row["scaffold_run_id"],
+                    "contract_id": row["contract_id"],
+                    "task_name": row["task_name"],
                 }
             )
 
     remaining = max(limit - len(actions), 0)
     if remaining:
+        unsettled = conn.execute(
+            "SELECT sub.id, sub.scaffold_run_id, sub.status, sr.contract_id,"
+            " COALESCE(NULLIF(sub.external_id, ''), ("
+            "   SELECT p.task_name FROM publish_records p"
+            "   WHERE p.scaffold_run_id = sub.scaffold_run_id"
+            "     AND p.status IN ('published', 'no_changes')"
+            "   ORDER BY p.id DESC LIMIT 1"
+            " )) AS task_name"
+            " FROM submissions sub"
+            " JOIN ("
+            "   SELECT scaffold_run_id, MAX(id) AS id"
+            "   FROM submissions"
+            "   GROUP BY scaffold_run_id"
+            " ) latest ON latest.id = sub.id"
+            " JOIN scaffold_runs sr ON sr.id = sub.scaffold_run_id"
+            f" WHERE LOWER(sub.status) IN ({_marks(POLLABLE_SUBMISSION_STATUSES)})"
+            " ORDER BY sub.updated_at DESC, sub.id DESC LIMIT ?",
+            (*POLLABLE_SUBMISSION_STATUSES, remaining),
+        ).fetchall()
+        for row in unsettled:
+            task_name = row["task_name"] or ""
+            action = (
+                f"synthtask smoldata watch {task_name} --scaffold-run-id {row['scaffold_run_id']}"
+                if task_name
+                else f"synthtask publish run {row['scaffold_run_id']} --task-name <task-name>"
+            )
+            actions.append(
+                {
+                    "stage": "poll",
+                    "target": f"submission:{row['id']}",
+                    "action": action,
+                    "reason": f"Codimango status {row['status']!r} has not settled",
+                    "scaffold_run_id": row["scaffold_run_id"],
+                    "contract_id": row["contract_id"],
+                    "task_name": task_name,
+                    "route": triage_route(row["status"]),
+                }
+            )
+
+    remaining = max(limit - len(actions), 0)
+    if remaining:
+        unroutable = SETTLED_OK_SUBMISSION_STATUSES + POLLABLE_SUBMISSION_STATUSES
         latest_failed_submissions = conn.execute(
             "SELECT sub.id, sub.scaffold_run_id, sub.status, sr.contract_id,"
             " EXISTS ("
@@ -888,9 +986,9 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
             "   GROUP BY scaffold_run_id"
             " ) latest ON latest.id = sub.id"
             " JOIN scaffold_runs sr ON sr.id = sub.scaffold_run_id"
-            " WHERE LOWER(sub.status) NOT IN ('accepted', 'passed', 'pending')"
+            f" WHERE LOWER(sub.status) NOT IN ({_marks(unroutable)})"
             " ORDER BY sub.updated_at DESC, sub.id DESC LIMIT ?",
-            (remaining,),
+            (*unroutable, remaining),
         ).fetchall()
         for row in latest_failed_submissions:
             route = triage_route(row["status"])

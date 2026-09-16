@@ -208,6 +208,23 @@ CREATE TABLE IF NOT EXISTS learning_events (
     created_at   REAL NOT NULL
 );
 
+-- Per-contract run settings. Without these the orchestrator only ever learns how to
+-- verify and publish a task from CLI flags, so an unattended sweep has nothing to go on.
+CREATE TABLE IF NOT EXISTS contract_settings (
+    contract_id       INTEGER PRIMARY KEY REFERENCES task_contracts(id),
+    verify_commands   TEXT NOT NULL DEFAULT '[]',
+    canonical_root    TEXT NOT NULL DEFAULT '',
+    publish_task_name TEXT NOT NULL DEFAULT '',
+    publish_remote    TEXT NOT NULL DEFAULT '',
+    publish_branch    TEXT NOT NULL DEFAULT '',
+    publish_method    TEXT NOT NULL DEFAULT '',
+    smoldata_site     TEXT NOT NULL DEFAULT '',
+    source_repo       TEXT NOT NULL DEFAULT '',
+    auto_advance      INTEGER NOT NULL DEFAULT 0,
+    created_at        REAL NOT NULL,
+    updated_at        REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_ideas_seed ON ideas(seed_id);
 CREATE INDEX IF NOT EXISTS idx_ideas_run  ON ideas(run_id);
 CREATE INDEX IF NOT EXISTS idx_runs_seed  ON runs(seed_id);
@@ -621,3 +638,52 @@ def add_learning_event(conn: sqlite3.Connection, **kw: Any) -> int:
     )
     conn.commit()
     return cur.lastrowid
+
+
+# --- contract settings ----------------------------------------------------
+
+
+CONTRACT_SETTING_FIELDS = (
+    "verify_commands",
+    "canonical_root",
+    "publish_task_name",
+    "publish_remote",
+    "publish_branch",
+    "publish_method",
+    "smoldata_site",
+    "source_repo",
+    "auto_advance",
+)
+
+
+def get_contract_settings(
+    conn: sqlite3.Connection, contract_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM contract_settings WHERE contract_id = ?", (contract_id,)
+    ).fetchone()
+
+
+def set_contract_settings(conn: sqlite3.Connection, contract_id: int, **kw: Any) -> None:
+    unknown = set(kw) - set(CONTRACT_SETTING_FIELDS)
+    if unknown:
+        raise ValueError(f"unknown contract setting(s): {', '.join(sorted(unknown))}")
+    now = time.time()
+    conn.execute(
+        "INSERT INTO contract_settings (contract_id, created_at, updated_at)"
+        " VALUES (?, ?, ?) ON CONFLICT(contract_id) DO NOTHING",
+        (contract_id, now, now),
+    )
+    if kw:
+        sets = ", ".join(f"{k} = ?" for k in kw)
+        conn.execute(
+            f"UPDATE contract_settings SET {sets}, updated_at = ? WHERE contract_id = ?",
+            (*kw.values(), now, contract_id),
+        )
+    conn.commit()
+
+
+def list_contract_settings(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM contract_settings ORDER BY contract_id"
+    ).fetchall()

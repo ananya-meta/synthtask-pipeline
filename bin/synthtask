@@ -1,0 +1,12 @@
+#!/bin/sh
+# Runnable without an install step: the repo is stdlib-only by design and the system
+# Python has no pip, so `pyproject.toml`'s console script never gets generated.
+set -eu
+
+here=$(dirname "$(readlink -f "$0")")
+repo=$(dirname "$here")
+
+PYTHONPATH="$repo${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+
+exec python3 -m ideation.cli "$@"

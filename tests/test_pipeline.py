@@ -13,7 +13,39 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ideation import cli, db, dedup, generate, lifecycle, orchestrator, publisher, report, smoldata
+from ideation import (
+    cli,
+    db,
+    dedup,
+    generate,
+    lifecycle,
+    orchestrator,
+    publisher,
+    report,
+    smoldata,
+    sweep,
+)
+
+
+_SCAFFOLD_SANDBOX: tempfile.TemporaryDirectory | None = None
+_REAL_SCAFFOLD_ROOT = lifecycle.SCAFFOLD_ROOT
+
+
+def setUpModule():
+    """Keep scaffold workspaces out of the real `runs/` tree.
+
+    `lifecycle.SCAFFOLD_ROOT` is resolved from the repo root, so without this every test
+    that starts a scaffold leaves a timestamped directory behind in the live corpus.
+    """
+    global _SCAFFOLD_SANDBOX
+    _SCAFFOLD_SANDBOX = tempfile.TemporaryDirectory()
+    lifecycle.SCAFFOLD_ROOT = Path(_SCAFFOLD_SANDBOX.name)
+
+
+def tearDownModule():
+    lifecycle.SCAFFOLD_ROOT = _REAL_SCAFFOLD_ROOT
+    if _SCAFFOLD_SANDBOX is not None:
+        _SCAFFOLD_SANDBOX.cleanup()
 
 
 def make_corpus(conn):
@@ -958,6 +990,369 @@ class TestSmoldata(unittest.TestCase):
             result = smoldata.agentic_review("task-123")
         self.assertEqual(result["status"], "pending")
         self.assertEqual(result["returncode"], 1)
+
+
+CONTRACT_FIXTURE = {
+    "hidden_principle": "Hidden graph cases.",
+    "allowed_inputs": '["visible graph"]',
+    "forbidden_leaks": '["hidden graph"]',
+    "oracle_strategy": "Compare against hidden graph oracle.",
+    "mutation_strategy": "Reject constant outputs.",
+    "infra_requirements": "stdlib Python.",
+    "difficulty_target": "Not solved by a noop.",
+}
+
+
+class TestUnsettledSubmissions(unittest.TestCase):
+    """A submission row is written the moment a task is published, so anything that is
+    not yet a verdict has to stay visible or the task drops out of the controller."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.conn = db.connect(self.root / "t.db")
+        self.seed_id, self.runs = make_corpus(self.conn)
+        self.idea_id = db.add_idea(
+            self.conn,
+            self.runs["codex"],
+            self.seed_id,
+            {"title": "pollable", "statement": "s", "assumption_broken": "a"},
+        )
+        db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
+        self.contract_id = lifecycle.create_contract(
+            self.conn, self.idea_id, **CONTRACT_FIXTURE
+        )
+        self.assertEqual(lifecycle.mark_contract_ready(self.conn, self.contract_id), [])
+        self.scaffold_id, self.scaffold_root = lifecycle.start_scaffold(
+            self.conn, self.contract_id
+        )
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def _submit(self, status: str, external_id: str = "task-123") -> int:
+        return lifecycle.record_submission(
+            self.conn,
+            self.scaffold_id,
+            platform="smoldata",
+            external_id=external_id,
+            status=status,
+        )
+
+    def test_pending_submission_surfaces_a_poll_action(self):
+        self._submit("pending")
+        actions = lifecycle.next_actions(self.conn)
+        self.assertEqual([a["stage"] for a in actions], ["poll"])
+        action = actions[0]
+        self.assertEqual(action["route"], "poll")
+        self.assertEqual(action["task_name"], "task-123")
+        self.assertEqual(action["scaffold_run_id"], self.scaffold_id)
+        self.assertIn("synthtask smoldata watch task-123", action["action"])
+
+    def test_every_unsettled_status_is_pollable(self):
+        for status in lifecycle.POLLABLE_SUBMISSION_STATUSES:
+            with self.subTest(status=status):
+                self._submit(status)
+                stages = [a["stage"] for a in lifecycle.next_actions(self.conn)]
+                self.assertEqual(stages, ["poll"], f"{status} fell out of next_actions")
+
+    def test_settled_failure_still_routes_to_triage(self):
+        self._submit("too_easy")
+        actions = lifecycle.next_actions(self.conn)
+        self.assertEqual([a["stage"] for a in actions], ["triage"])
+        self.assertEqual(actions[0]["route"], "reduce_leakage_or_add_hidden_state")
+
+    def test_accepted_submission_needs_no_action(self):
+        self._submit("accepted")
+        self.assertEqual(lifecycle.next_actions(self.conn), [])
+
+    def test_poll_falls_back_to_the_published_task_name(self):
+        db.add_publish_record(
+            self.conn,
+            scaffold_run_id=self.scaffold_id,
+            task_name="published-name",
+            remote_url="https://example.invalid/repo.git",
+            branch="main",
+            commit_sha="abc",
+            github_url="https://example.invalid/repo/tree/abc/published-name",
+            status="published",
+            payload_json="{}",
+        )
+        self._submit("pending", external_id="")
+        action = lifecycle.next_actions(self.conn)[0]
+        self.assertEqual(action["stage"], "poll")
+        self.assertEqual(action["task_name"], "published-name")
+
+
+class TestFanoutGuards(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conn = db.connect(Path(self.tmp.name) / "t.db")
+        self.seed_id, self.runs = make_corpus(self.conn)
+        self.idea_id = db.add_idea(
+            self.conn,
+            self.runs["codex"],
+            self.seed_id,
+            {"title": "guarded", "statement": "s", "assumption_broken": "a"},
+        )
+        db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def test_live_contract_blocks_a_second_draft(self):
+        first = lifecycle.create_contract(self.conn, self.idea_id, **CONTRACT_FIXTURE)
+        with self.assertRaises(lifecycle.LifecycleError) as caught:
+            lifecycle.create_contract(self.conn, self.idea_id, **CONTRACT_FIXTURE)
+        self.assertIn(f"contract #{first}", str(caught.exception))
+
+        forced = lifecycle.create_contract(
+            self.conn, self.idea_id, force=True, **CONTRACT_FIXTURE
+        )
+        self.assertNotEqual(forced, first)
+
+    def test_shelved_contract_frees_the_idea(self):
+        first = lifecycle.create_contract(self.conn, self.idea_id, **CONTRACT_FIXTURE)
+        db.update_task_contract_status(self.conn, first, "shelved")
+        self.assertNotEqual(
+            lifecycle.create_contract(self.conn, self.idea_id, **CONTRACT_FIXTURE), first
+        )
+
+    def test_live_scaffold_blocks_a_second_revision(self):
+        contract_id = lifecycle.create_contract(self.conn, self.idea_id, **CONTRACT_FIXTURE)
+        self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
+        first, _ = lifecycle.start_scaffold(self.conn, contract_id)
+        with self.assertRaises(lifecycle.LifecycleError) as caught:
+            lifecycle.start_scaffold(self.conn, contract_id)
+        self.assertIn(f"scaffold #{first}", str(caught.exception))
+
+        explicit, _ = lifecycle.start_scaffold(self.conn, contract_id, revision=9)
+        self.assertNotEqual(explicit, first)
+
+    def test_submitted_scaffold_allows_the_revision_loop(self):
+        contract_id = lifecycle.create_contract(self.conn, self.idea_id, **CONTRACT_FIXTURE)
+        self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
+        first, _ = lifecycle.start_scaffold(self.conn, contract_id)
+        lifecycle.record_submission(
+            self.conn, first, platform="smoldata", external_id="t", status="too_easy"
+        )
+        second, _ = lifecycle.start_scaffold(self.conn, contract_id)
+        self.assertNotEqual(second, first)
+
+
+class TestContractSettings(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.conn = db.connect(self.root / "t.db")
+        self.seed_id, self.runs = make_corpus(self.conn)
+        self.idea_id = db.add_idea(
+            self.conn,
+            self.runs["codex"],
+            self.seed_id,
+            {"title": "configured", "statement": "s", "assumption_broken": "a"},
+        )
+        db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
+        self.contract_id = lifecycle.create_contract(
+            self.conn, self.idea_id, **CONTRACT_FIXTURE
+        )
+        self.assertEqual(lifecycle.mark_contract_ready(self.conn, self.contract_id), [])
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def test_settings_upsert_preserves_untouched_fields(self):
+        db.set_contract_settings(self.conn, self.contract_id, publish_task_name="alpha")
+        db.set_contract_settings(self.conn, self.contract_id, auto_advance=1)
+        row = db.get_contract_settings(self.conn, self.contract_id)
+        self.assertEqual(row["publish_task_name"], "alpha")
+        self.assertEqual(row["auto_advance"], 1)
+
+    def test_unknown_setting_is_rejected(self):
+        with self.assertRaises(ValueError):
+            db.set_contract_settings(self.conn, self.contract_id, nonsense="x")
+
+    def test_stored_settings_drive_a_bare_pipeline_run(self):
+        scaffold_id, scaffold_root = lifecycle.start_scaffold(self.conn, self.contract_id)
+        make_task_tree(scaffold_root, "task")
+        lifecycle.record_review(
+            self.conn, scaffold_id, reviewer="tbh", kind="adversarial", verdict="approve"
+        )
+        remote = make_bare_remote(self.root)
+        db.set_contract_settings(
+            self.conn,
+            self.contract_id,
+            verify_commands=json.dumps([f"{sys.executable} -c print(1)"]),
+            canonical_root=str(self.root / "canonical"),
+            publish_task_name="settings-task",
+            publish_remote=str(remote),
+            publish_method="git",
+            auto_advance=1,
+        )
+
+        # Nothing but the scaffold id: the contract, verifier and publish target all
+        # come from the stored settings.
+        result = orchestrator.run(
+            self.conn,
+            orchestrator.PipelineRunConfig(
+                scaffold_run_id=scaffold_id, stop_after="publish", allow_build=False
+            ),
+        )
+
+        self.assertEqual(result.blocked_at, "")
+        self.assertEqual(result.ids["contract_id"], self.contract_id)
+        for stage in ("verify", "audit", "promote", "publish"):
+            self.assertIn(stage, result.completed)
+        self.assertIn("settings-task/task.toml", remote_files(remote))
+
+    def test_explicit_flags_beat_stored_settings(self):
+        db.set_contract_settings(self.conn, self.contract_id, publish_task_name="stored")
+        config = orchestrator.PipelineRunConfig(
+            contract_id=self.contract_id, publish_task_name="explicit"
+        )
+        orchestrator.apply_contract_settings(self.conn, self.contract_id, config)
+        self.assertEqual(config.publish_task_name, "explicit")
+
+    def test_no_build_blocks_instead_of_invoking_the_builder(self):
+        scaffold_id, _ = lifecycle.start_scaffold(self.conn, self.contract_id)
+        with mock.patch.object(lifecycle, "run_scaffold_worker") as worker:
+            result = orchestrator.run(
+                self.conn,
+                orchestrator.PipelineRunConfig(
+                    scaffold_run_id=scaffold_id, stop_after="build", allow_build=False
+                ),
+            )
+        worker.assert_not_called()
+        self.assertEqual(result.blocked_at, "build")
+        self.assertIn("may not invoke a builder", result.reason)
+
+
+class TestSweep(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.conn = db.connect(self.root / "t.db")
+        self.seed_id, self.runs = make_corpus(self.conn)
+        self.idea_id = db.add_idea(
+            self.conn,
+            self.runs["codex"],
+            self.seed_id,
+            {"title": "sweepable", "statement": "s", "assumption_broken": "a"},
+        )
+        db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
+        self.contract_id = lifecycle.create_contract(
+            self.conn, self.idea_id, **CONTRACT_FIXTURE
+        )
+        self.assertEqual(lifecycle.mark_contract_ready(self.conn, self.contract_id), [])
+        self.scaffold_id, self.scaffold_root = lifecycle.start_scaffold(
+            self.conn, self.contract_id
+        )
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def test_poll_records_the_settled_status(self):
+        lifecycle.record_submission(
+            self.conn,
+            self.scaffold_id,
+            platform="smoldata",
+            external_id="task-123",
+            status="pending",
+        )
+        observed = {"status": "too_easy", "payload": {"task": {"status": "draft"}}}
+        with mock.patch.object(sweep.smoldata, "show_task", return_value=observed) as show:
+            summary = sweep.run(self.conn)
+
+        show.assert_called_once()
+        self.assertEqual(summary["polled"][0]["status"], "too_easy")
+        self.assertEqual(summary["errors"], [])
+        latest = self.conn.execute(
+            "SELECT status FROM submissions ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(latest["status"], "too_easy")
+
+    def test_poll_runs_even_without_auto_advance(self):
+        lifecycle.record_submission(
+            self.conn,
+            self.scaffold_id,
+            platform="smoldata",
+            external_id="task-123",
+            status="pending",
+        )
+        observed = {"status": "pending", "payload": {}}
+        with mock.patch.object(sweep.smoldata, "show_task", return_value=observed):
+            summary = sweep.run(self.conn)
+        self.assertEqual(len(summary["polled"]), 1)
+
+    def test_advance_is_skipped_without_auto_advance(self):
+        make_task_tree(self.scaffold_root, "task")
+        lifecycle.run_verification(
+            self.conn, self.scaffold_id, [sys.executable, "-c", "print(1)"]
+        )
+        summary = sweep.run(self.conn)
+        self.assertEqual(summary["advanced"], [])
+        self.assertEqual(summary["waiting_on_you"][0]["stage"], "audit")
+
+    def test_human_stages_are_reported_never_driven(self):
+        # A verified scaffold awaiting audit, plus a settled failure awaiting triage.
+        make_task_tree(self.scaffold_root, "task")
+        lifecycle.run_verification(
+            self.conn, self.scaffold_id, [sys.executable, "-c", "print(1)"]
+        )
+        db.set_contract_settings(self.conn, self.contract_id, auto_advance=1)
+        summary = sweep.run(self.conn)
+        self.assertEqual(summary["advanced"], [])
+        self.assertEqual(
+            [item["stage"] for item in summary["waiting_on_you"]], ["audit"]
+        )
+
+    def test_sweep_never_invokes_a_builder(self):
+        db.set_contract_settings(self.conn, self.contract_id, auto_advance=1)
+        with mock.patch.object(sweep.lifecycle, "run_scaffold_worker") as worker:
+            sweep.run(self.conn)
+        worker.assert_not_called()
+
+    def test_dry_run_touches_nothing(self):
+        lifecycle.record_submission(
+            self.conn,
+            self.scaffold_id,
+            platform="smoldata",
+            external_id="task-123",
+            status="pending",
+        )
+        before = self.conn.execute("SELECT COUNT(*) FROM submissions").fetchone()[0]
+        with mock.patch.object(sweep.smoldata, "show_task") as show:
+            summary = sweep.run(self.conn, dry_run=True)
+        show.assert_not_called()
+        self.assertTrue(summary["polled"][0]["dry_run"])
+        after = self.conn.execute("SELECT COUNT(*) FROM submissions").fetchone()[0]
+        self.assertEqual(before, after)
+
+    def test_poll_failure_is_reported_not_raised(self):
+        lifecycle.record_submission(
+            self.conn,
+            self.scaffold_id,
+            platform="smoldata",
+            external_id="task-123",
+            status="pending",
+        )
+        with mock.patch.object(
+            sweep.smoldata, "show_task", side_effect=smoldata.SmoldataError("502 from nest")
+        ):
+            summary = sweep.run(self.conn)
+        self.assertEqual(summary["polled"], [])
+        self.assertIn("502 from nest", summary["errors"][0]["error"])
+
+    def test_lock_refuses_a_concurrent_sweep(self):
+        lock_path = self.root / "sweep.lock"
+        with sweep.exclusive_lock(lock_path):
+            with self.assertRaises(sweep.SweepError):
+                with sweep.exclusive_lock(lock_path):
+                    pass
 
 
 if __name__ == "__main__":

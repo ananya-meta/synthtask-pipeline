@@ -1,5 +1,6 @@
 data/*.db
 data/*.db-journal
+data/sweep.lock
 runs/
 __pycache__/
 *.pyc

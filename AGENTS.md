@@ -47,11 +47,22 @@ shapes what tasks come out. Harness code is fine.
    benchmark checkout by hand.
 6. **Stdlib only.** No third-party runtime dependencies — the tool must run with system
    Python and no venv.
+7. **The sweep never originates work.** `synthtask sweep` runs unattended on a cron, so it
+   is restricted to polling external status and advancing scaffolds whose contract set
+   `auto_advance`. Drafting contracts, starting scaffolds, invoking builders, recording
+   audit verdicts, and choosing a revision route stay human. Do not widen
+   `sweep.DISPATCHABLE_STAGES` without settling that question first.
+8. **A submission row is not a verdict.** Codimango records `pending`/`draft` long before
+   it records a result, so anything unsettled has to stay visible in `next_actions` —
+   see `lifecycle.POLLABLE_SUBMISSION_STATUSES`. A task that silently falls out of
+   `next_actions` is a task nobody is tracking.
 
 ## Layout
 
 ```
-ideation/   db · seeds · generate · dedup · judge · review · lifecycle · orchestrator · publisher · smoldata · report · cli
+ideation/   db · seeds · generate · dedup · judge · review · lifecycle · orchestrator · publisher · smoldata · sweep · report · cli
+bin/        no-install `synthtask` entry point
+tools/      cron_sweep.sh · demo/check helpers
 prompts/    human-authored (see prompts/README.md)
 seeds/NN-slug/   abstract.md · paper.md · ASSUMPTIONS.md · meta.json
 runs/<seed>/<generator>/<ts>/   idea-generation isolation roots

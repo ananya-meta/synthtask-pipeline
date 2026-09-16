@@ -18,6 +18,7 @@ from . import (
     report,
     seeds,
     smoldata,
+    sweep,
 )
 
 
@@ -564,6 +565,7 @@ def cmd_pipeline_run(args) -> int:
         stop_after=args.stop_after,
         force_contract=args.force_contract,
         allow_draft_scaffold=args.allow_draft_scaffold,
+        allow_build=not args.no_build,
         contract_overrides=overrides,
     )
     try:
@@ -573,6 +575,76 @@ def cmd_pipeline_run(args) -> int:
         return 1
     print(json.dumps(result.as_dict(), indent=2, ensure_ascii=False))
     return 1 if result.blocked_at else 0
+
+
+def _settings_row_dict(row) -> dict:
+    data = {k: row[k] for k in db.CONTRACT_SETTING_FIELDS}
+    data["contract_id"] = row["contract_id"]
+    data["auto_advance"] = bool(row["auto_advance"])
+    data["verify_commands"] = json.loads(row["verify_commands"] or "[]")
+    return data
+
+
+def cmd_settings_set(args) -> int:
+    conn = db.connect(args.db)
+    if db.get_task_contract(conn, args.contract_id) is None:
+        print(f"error: no contract #{args.contract_id}", file=sys.stderr)
+        return 1
+
+    updates: dict = {}
+    if args.verify_command:
+        for command in args.verify_command:
+            orchestrator.parse_command(command)  # reject unparseable early
+        updates["verify_commands"] = json.dumps(args.verify_command)
+    if args.canonical_root is not None:
+        updates["canonical_root"] = str(Path(args.canonical_root).expanduser())
+    for attr in (
+        "publish_task_name",
+        "publish_remote",
+        "publish_branch",
+        "publish_method",
+        "smoldata_site",
+        "source_repo",
+    ):
+        value = getattr(args, attr)
+        if value is not None:
+            updates[attr] = value
+    if args.auto_advance is not None:
+        updates["auto_advance"] = int(args.auto_advance)
+
+    db.set_contract_settings(conn, args.contract_id, **updates)
+    print(json.dumps(_settings_row_dict(db.get_contract_settings(conn, args.contract_id)), indent=2))
+    return 0
+
+
+def cmd_settings_show(args) -> int:
+    conn = db.connect(args.db)
+    row = db.get_contract_settings(conn, args.contract_id)
+    if row is None:
+        print(f"contract #{args.contract_id} has no stored settings")
+        return 1
+    print(json.dumps(_settings_row_dict(row), indent=2))
+    return 0
+
+
+def cmd_settings_list(args) -> int:
+    conn = db.connect(args.db)
+    rows = [_settings_row_dict(r) for r in db.list_contract_settings(conn)]
+    print(json.dumps(rows, indent=2))
+    return 0
+
+
+def cmd_sweep(args) -> int:
+    conn = db.connect(args.db)
+    try:
+        with sweep.exclusive_lock():
+            summary = sweep.run(conn, dry_run=args.dry_run, limit=args.limit)
+    except sweep.SweepError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(summary, indent=2) if args.json else sweep.format_summary(summary))
+    # Blocked tasks are the normal resting state, so only harness faults are non-zero.
+    return 1 if summary["errors"] else 0
 
 
 def cmd_smoldata_show(args) -> int:
@@ -899,6 +971,11 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--stop-after", default="learn", choices=orchestrator.STAGES)
     pr.add_argument("--force-contract", action="store_true")
     pr.add_argument("--allow-draft-scaffold", action="store_true")
+    pr.add_argument(
+        "--no-build",
+        action="store_true",
+        help="block at `build` instead of invoking the builder on an unbuilt scaffold",
+    )
     pr.add_argument("--objective", default=None)
     pr.add_argument("--hidden-principle", default=None)
     pr.add_argument("--allowed-input", action="append", default=[])
@@ -908,6 +985,53 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--infra-requirement", default=None)
     pr.add_argument("--difficulty-target", default=None)
     pr.set_defaults(func=cmd_pipeline_run)
+
+    settings = sub.add_parser(
+        "settings", help="per-contract run settings used by unattended sweeps"
+    ).add_subparsers(dest="settingscmd", required=True)
+
+    setset = settings.add_parser("set", help="set stored run settings for a contract")
+    setset.add_argument("contract_id", type=int)
+    setset.add_argument(
+        "--verify-command",
+        action="append",
+        default=None,
+        help="repeatable; replaces the stored list",
+    )
+    setset.add_argument("--canonical-root", default=None)
+    setset.add_argument("--publish-task-name", default=None)
+    setset.add_argument("--publish-remote", default=None)
+    setset.add_argument("--publish-branch", default=None)
+    setset.add_argument("--publish-method", default=None, choices=["auto", "git", "github-api"])
+    setset.add_argument("--smoldata-site", default=None, choices=["default", "nest", "vanilla"])
+    setset.add_argument("--source-repo", default=None)
+    setset.add_argument(
+        "--auto-advance",
+        dest="auto_advance",
+        action="store_true",
+        default=None,
+        help="let `synthtask sweep` advance this contract's scaffolds",
+    )
+    setset.add_argument(
+        "--no-auto-advance", dest="auto_advance", action="store_false", default=None
+    )
+    setset.set_defaults(func=cmd_settings_set)
+
+    setshow = settings.add_parser("show", help="print stored settings for a contract")
+    setshow.add_argument("contract_id", type=int)
+    setshow.set_defaults(func=cmd_settings_show)
+
+    setlist = settings.add_parser("list", help="print stored settings for every contract")
+    setlist.set_defaults(func=cmd_settings_list)
+
+    sw = sub.add_parser(
+        "sweep",
+        help="poll unsettled validations and advance opted-in scaffolds (cron entry point)",
+    )
+    sw.add_argument("--dry-run", action="store_true")
+    sw.add_argument("--limit", type=int, default=50)
+    sw.add_argument("--json", action="store_true")
+    sw.set_defaults(func=cmd_sweep)
 
     sd = sub.add_parser("smoldata", help="watch and import Smoldata/Codimango feedback").add_subparsers(
         dest="smoldata_cmd", required=True

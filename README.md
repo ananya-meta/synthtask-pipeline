@@ -39,6 +39,13 @@ cd synthtask-pipeline
 uv tool install --editable .     # installs `synthtask`; `ideation` remains an alias
 ```
 
+Where the system Python has no pip and you would rather not install anything, `bin/synthtask`
+is an equivalent no-install entry point — symlink it onto your `PATH`:
+
+```bash
+ln -sfn "$PWD/bin/synthtask" ~/bin/synthtask
+```
+
 ## Ideation Flow
 
 ```bash
@@ -147,6 +154,51 @@ synthtask pipeline run \
   --stop-after publish
 ```
 
+Passing only `--scaffold-run-id` is enough to resume an existing task: the contract is
+looked up from the scaffold, and `build`/`verify`/`promote`/`publish` each skip work that
+is already done, so re-running is safe. `--no-build` blocks at `build` rather than
+invoking a builder on an unbuilt scaffold.
+
+Contracts, by contrast, are not re-entrant: drafting a second contract for an idea that
+already has a live one, or starting a second scaffold for a contract that already has a
+live one, is refused. Use `--force` / `--revision` when that is genuinely what you want —
+the revision loop after a Smoldata rejection still works, because a `submitted` scaffold
+is no longer live.
+
+## Unattended Sweeps
+
+`synthtask sweep` is the cron entry point. It does exactly two things: re-polls Codimango
+for submissions whose validation has not settled, and advances scaffolds whose contract
+opted in. It never drafts a contract, starts a scaffold, invokes a builder, records an
+audit verdict, or decides how to revise a rejected task — those stay human calls and are
+reported as `waiting`.
+
+```bash
+synthtask settings set 1 \
+  --verify-command "python3 -m unittest discover -s tests" \
+  --canonical-root /path/to/canonical-task-root \
+  --publish-task-name my-task-name \
+  --auto-advance
+
+synthtask sweep --dry-run     # show the dispatch plan
+synthtask sweep               # poll + advance
+```
+
+Polling is ungated: it only records external truth, so it runs for every unsettled
+submission. `--auto-advance` gates the mutating stages (`verify`, `promote`, `publish`,
+`smoldata`) and is off by default, so installing the cron changes nothing until a
+contract opts in.
+
+Install the hourly job with:
+
+```cron
+17 * * * * /path/to/synthtask-pipeline/tools/cron_sweep.sh
+```
+
+The wrapper restores the `PATH` cron does not provide (`codimango` lives under
+`~/.local/bin`), rotates `~/logs/synthtask-sweep.log` at 5 MB, and exits non-zero only on
+a harness fault — a blocked task is the normal resting state.
+
 ## Where Smoldata Fits
 
 Smoldata is the external validation and feedback gate, not the source of task ideas and
@@ -186,7 +238,7 @@ Smoldata feedback is mapped into controller routing:
 | Smoldata signal | Pipeline route |
 |---|---|
 | `accepted` | done |
-| `pending` | poll again |
+| `pending` / `published` / `draft` / `unknown` | poll again |
 | `infra` / `infra_error` | fix Docker/runtime/artifacts |
 | `bad_grading_weak` | strengthen hidden oracle and mutation tests |
 | `grading_wrong` | fix verifier contract |
