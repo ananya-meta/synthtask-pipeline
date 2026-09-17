@@ -1421,6 +1421,95 @@ class TestFailureClassification(unittest.TestCase):
         self.assertTrue(lifecycle.is_failed_status("failed_unclassified"))
 
 
+class TestAdviceMatchesEnforcement(unittest.TestCase):
+    """Every command `next_actions` prints must actually be runnable.
+
+    A derived view that suggests a command its own guards refuse is worse than no advice:
+    it looks like progress and cannot be followed.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conn = db.connect(Path(self.tmp.name) / "t.db")
+        self.seed_id, self.runs = make_corpus(self.conn)
+        self.idea_id = db.add_idea(
+            self.conn,
+            self.runs["codex"],
+            self.seed_id,
+            {
+                "title": "advised",
+                "statement": "Reconcile advice with enforcement across the controller.",
+                "assumption_broken": "a",
+            },
+        )
+        db.add_verdict(self.conn, self.idea_id, "accept", "ACCEPT")
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def _failed_contract(self) -> tuple[int, int]:
+        contract_id = lifecycle.create_contract(self.conn, self.idea_id, **CONTRACT_FIXTURE)
+        self.assertEqual(lifecycle.mark_contract_ready(self.conn, contract_id), [])
+        scaffold_id, _ = lifecycle.start_scaffold(self.conn, contract_id)
+        lifecycle.record_submission(
+            self.conn, scaffold_id, platform="smoldata", external_id="t", status="too_easy"
+        )
+        return contract_id, scaffold_id
+
+    def test_triage_suggests_a_revision_when_none_is_open(self):
+        contract_id, _ = self._failed_contract()
+        triage = [a for a in lifecycle.next_actions(self.conn) if a["stage"] == "triage"][0]
+        self.assertIsNone(triage["live_scaffold_run_id"])
+        self.assertEqual(
+            triage["action"], f"synthtask scaffold start {contract_id} --builder codex"
+        )
+        # The suggested command must succeed.
+        lifecycle.start_scaffold(self.conn, contract_id, builder="codex")
+
+    def test_triage_defers_when_a_revision_is_already_open(self):
+        contract_id, _ = self._failed_contract()
+        open_id, _ = lifecycle.start_scaffold(self.conn, contract_id, builder="codex")
+
+        triage = [a for a in lifecycle.next_actions(self.conn) if a["stage"] == "triage"][0]
+        self.assertEqual(triage["live_scaffold_run_id"], open_id)
+        self.assertNotIn(f"scaffold start {contract_id}", triage["action"])
+        self.assertIn(f"audit record {open_id}", triage["action"])
+        self.assertIn("still open", triage["reason"])
+
+    def test_the_deferred_advice_actually_unblocks_the_contract(self):
+        contract_id, _ = self._failed_contract()
+        open_id, _ = lifecycle.start_scaffold(self.conn, contract_id, builder="codex")
+        with self.assertRaises(lifecycle.LifecycleError):
+            lifecycle.start_scaffold(self.conn, contract_id)
+
+        # Following the advice must clear the block.
+        lifecycle.record_review(
+            self.conn, open_id, reviewer="me", kind="adversarial", verdict="reject"
+        )
+        lifecycle.start_scaffold(self.conn, contract_id, builder="codex")
+
+    def test_shelved_contract_returns_the_idea_to_the_board(self):
+        contract_id = lifecycle.create_contract(self.conn, self.idea_id, **CONTRACT_FIXTURE)
+        self.assertEqual(
+            [a["stage"] for a in lifecycle.next_actions(self.conn)], ["contract"]
+        )
+
+        db.update_task_contract_status(self.conn, contract_id, "shelved")
+        actions = lifecycle.next_actions(self.conn)
+        self.assertEqual([a["stage"] for a in actions], ["contract"])
+        self.assertEqual(
+            actions[0]["action"], f"synthtask contract create {self.idea_id}"
+        )
+        # And the command it prints is runnable.
+        lifecycle.create_contract(self.conn, self.idea_id, **CONTRACT_FIXTURE)
+
+    def test_idea_with_a_live_contract_is_not_re_suggested(self):
+        lifecycle.create_contract(self.conn, self.idea_id, **CONTRACT_FIXTURE)
+        targets = [a["target"] for a in lifecycle.next_actions(self.conn)]
+        self.assertNotIn(f"idea:{self.idea_id}", targets)
+
+
 class TestContractQualityFloor(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

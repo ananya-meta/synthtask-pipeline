@@ -60,7 +60,12 @@ shapes what tasks come out. Harness code is fine.
    by seven call sites. Any gate phrased as "these states mean done" silently omits states
    added later — that is how a published scaffold came to be rebuilt. See
    `lifecycle.UNBUILT_STATES`, and prefer `is_failed_status()` over enumerating failures.
-10. **A revision must see the attempts it replaces.** `PRIOR_ATTEMPTS.md` and the
+10. **Advice and enforcement share one predicate.** Every command `next_actions` prints has
+    to be runnable. When a stage query decides "is something already in flight?" separately
+    from the guard that refuses the command, the two drift and the controller starts
+    printing instructions that error. Call `live_contract()` / `live_scaffold()` from both
+    sides rather than re-deriving the condition in SQL.
+11. **A revision must see the attempts it replaces.** `PRIOR_ATTEMPTS.md` and the
     `{{PRIOR_ATTEMPTS}}` token exist because revisions were built from byte-identical
     inputs to the attempts that already failed. `run_scaffold_worker` refuses a revision
     whose prompt drops the token. The harness threads *evidence* — statuses, routes,

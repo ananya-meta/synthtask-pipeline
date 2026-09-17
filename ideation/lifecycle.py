@@ -116,6 +116,31 @@ def _marks(values: tuple[str, ...]) -> str:
     return ", ".join("?" for _ in values)
 
 
+def live_contract(conn, idea_id: int):
+    """The contract currently occupying this idea, if any."""
+    return conn.execute(
+        "SELECT id, status FROM task_contracts WHERE idea_id = ?"
+        f" AND status IN ({_marks(CONTRACT_LIVE_STATES)})"
+        " ORDER BY version DESC LIMIT 1",
+        (idea_id, *CONTRACT_LIVE_STATES),
+    ).fetchone()
+
+
+def live_scaffold(conn, contract_id: int):
+    """The scaffold currently occupying this contract, if any.
+
+    Shared by the `start_scaffold` guard and by `next_actions` on purpose: when the advice
+    and the enforcement compute "is something already in flight?" separately they drift,
+    and the controller starts printing commands that are guaranteed to fail.
+    """
+    return conn.execute(
+        "SELECT id, revision, state FROM scaffold_runs WHERE contract_id = ?"
+        f" AND state NOT IN ({_marks(SCAFFOLD_RESTARTABLE_STATES)})"
+        " ORDER BY revision DESC LIMIT 1",
+        (contract_id, *SCAFFOLD_RESTARTABLE_STATES),
+    ).fetchone()
+
+
 def _now_ts() -> str:
     return time.strftime("%Y%m%d-%H%M%S")
 
@@ -242,12 +267,7 @@ def create_contract(
         )
 
     if not force:
-        live = conn.execute(
-            "SELECT id, status FROM task_contracts WHERE idea_id = ?"
-            f" AND status IN ({_marks(CONTRACT_LIVE_STATES)})"
-            " ORDER BY version DESC LIMIT 1",
-            (idea_id, *CONTRACT_LIVE_STATES),
-        ).fetchone()
+        live = live_contract(conn, idea_id)
         if live is not None:
             raise LifecycleError(
                 f"idea #{idea_id} already has {live['status']} contract #{live['id']};"
@@ -429,12 +449,7 @@ def start_scaffold(
         raise LifecycleError(f"contract #{contract_id} has terminal status {row['status']!r}")
 
     if revision is None:
-        live = conn.execute(
-            "SELECT id, state FROM scaffold_runs WHERE contract_id = ?"
-            f" AND state NOT IN ({_marks(SCAFFOLD_RESTARTABLE_STATES)})"
-            " ORDER BY revision DESC LIMIT 1",
-            (contract_id, *SCAFFOLD_RESTARTABLE_STATES),
-        ).fetchone()
+        live = live_scaffold(conn, contract_id)
         if live is not None:
             raise LifecycleError(
                 f"contract #{contract_id} already has live scaffold #{live['id']}"
@@ -1006,13 +1021,17 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
     """Return controller-visible next steps without letting agents infer global state."""
     actions: list[dict] = []
 
+    # Matches `create_contract`'s own guard rather than "has no contract row at all", so an
+    # idea whose only contract was shelved comes back into view instead of vanishing.
     accepted_without_contract = conn.execute(
         "SELECT i.id, i.title FROM ideas i"
         " JOIN verdicts v ON v.idea_id = i.id"
-        " LEFT JOIN task_contracts c ON c.idea_id = i.id"
-        " WHERE v.verdict = 'accept' AND c.id IS NULL"
+        " WHERE v.verdict = 'accept' AND NOT EXISTS ("
+        "   SELECT 1 FROM task_contracts c WHERE c.idea_id = i.id"
+        f"    AND c.status IN ({_marks(CONTRACT_LIVE_STATES)})"
+        " )"
         " ORDER BY i.id LIMIT ?",
-        (limit,),
+        (*CONTRACT_LIVE_STATES, limit),
     ).fetchall()
     for row in accepted_without_contract:
         actions.append(
@@ -1266,14 +1285,31 @@ def next_actions(conn, limit: int = 20) -> list[dict]:
         for row in latest_failed_submissions:
             route = triage_route(row["status"])
             # `record_submission` captures the failure automatically now, so the revision
-            # is always the next step rather than something gated on recording it first.
-            action = f"synthtask scaffold start {row['contract_id']} --builder codex"
+            # is the next step rather than something gated on recording it first — unless a
+            # revision is already open, in which case `start_scaffold` would refuse and
+            # suggesting it would be advice that cannot be followed.
+            open_revision = live_scaffold(conn, row["contract_id"])
+            if open_revision is None:
+                action = f"synthtask scaffold start {row['contract_id']} --builder codex"
+                reason = f"latest Smoldata status routes to {route}"
+            else:
+                action = (
+                    f"finish or abandon scaffold #{open_revision['id']}"
+                    f" (revision {open_revision['revision']}, {open_revision['state']}) first"
+                    f" — `synthtask audit record {open_revision['id']} --verdict reject`"
+                    " frees the contract for a new revision"
+                )
+                reason = (
+                    f"latest Smoldata status routes to {route},"
+                    f" but revision {open_revision['revision']} is still open"
+                )
             actions.append(
                 {
                     "stage": "triage",
                     "target": f"submission:{row['id']}",
                     "action": action,
-                    "reason": f"latest Smoldata status routes to {route}",
+                    "reason": reason,
+                    "live_scaffold_run_id": open_revision["id"] if open_revision else None,
                     "scaffold_run_id": row["scaffold_run_id"],
                     "contract_id": row["contract_id"],
                     "route": route,
