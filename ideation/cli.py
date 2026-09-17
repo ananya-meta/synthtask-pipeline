@@ -712,6 +712,40 @@ def cmd_smoldata_rerun(args) -> int:
     return 0
 
 
+def cmd_smoldata_submit_collection(args) -> int:
+    conn = db.connect(args.db)
+    try:
+        payload = smoldata.submit_to_collection(
+            Path(args.source_dir),
+            collection_id=args.collection_id,
+            task_name=args.task_name or "",
+            api_url=args.api_url or "",
+            api_key_env=args.api_key_env,
+            env_file=Path(args.env_file) if args.env_file else None,
+            archive_out=Path(args.archive_out) if args.archive_out else None,
+            timeout=args.timeout,
+            dry_run=args.dry_run,
+        )
+    except smoldata.SmoldataError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if args.scaffold_run_id and not args.dry_run:
+        try:
+            lifecycle.record_submission(
+                conn,
+                args.scaffold_run_id,
+                platform="smoldata_collection",
+                external_id=args.collection_id,
+                status=payload["status"],
+                result=payload,
+            )
+        except lifecycle.LifecycleError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="synthtask", description=__doc__)
     p.add_argument("--db", default=None, help="path to the pipeline SQLite DB")
@@ -1064,6 +1098,34 @@ def build_parser() -> argparse.ArgumentParser:
     srr.add_argument("--site", default="default", choices=["default", "nest", "vanilla"])
     srr.add_argument("--timeout", type=int, default=900)
     srr.set_defaults(func=cmd_smoldata_rerun)
+
+    ssc = sd.add_parser(
+        "submit-collection",
+        help="package a task directory and upload it to a Smoldata collection",
+    )
+    ssc.add_argument("collection_id")
+    ssc.add_argument("source_dir")
+    ssc.add_argument(
+        "--task-name",
+        default="",
+        help="archive top-level task directory; defaults to source directory name",
+    )
+    ssc.add_argument("--api-url", default="", help="defaults to SMOLDATA_URL or https://smoldata.ai")
+    ssc.add_argument(
+        "--api-key-env",
+        default="SMOLDATA_API_KEY",
+        help="environment variable containing the Smoldata API key",
+    )
+    ssc.add_argument(
+        "--env-file",
+        default=str(smoldata.DEFAULT_ENV_FILE),
+        help="dotenv-style file used if the key is not already in the environment",
+    )
+    ssc.add_argument("--archive-out", default="", help="optional path for the generated tar.gz")
+    ssc.add_argument("--timeout", type=int, default=900)
+    ssc.add_argument("--scaffold-run-id", type=int, default=None)
+    ssc.add_argument("--dry-run", action="store_true", help="only build the upload archive")
+    ssc.set_defaults(func=cmd_smoldata_submit_collection)
 
     return p
 

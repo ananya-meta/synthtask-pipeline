@@ -9,15 +9,30 @@ records the resulting validation/review state.
 
 from __future__ import annotations
 
+import gzip
+import hashlib
 import json
+import os
+import secrets
 import subprocess
+import tarfile
+import tempfile
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+from . import publisher
 
 
 class SmoldataError(RuntimeError):
     pass
+
+
+DEFAULT_API_URL = "https://smoldata.ai"
+DEFAULT_ENV_FILE = Path.home() / ".smoldata-env"
 
 
 @dataclass(frozen=True)
@@ -262,3 +277,249 @@ def submission_record(
             **(payload or {}),
         },
     }
+
+
+def submit_to_collection(
+    source_dir: Path,
+    *,
+    collection_id: str,
+    task_name: str = "",
+    api_url: str = "",
+    api_key_env: str = "SMOLDATA_API_KEY",
+    env_file: Path | None = DEFAULT_ENV_FILE,
+    archive_out: Path | None = None,
+    timeout: int = 900,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    package = package_task_archive(
+        source_dir,
+        task_name=task_name,
+        archive_out=archive_out,
+    )
+    result: dict[str, Any] = {
+        "status": "dry_run" if dry_run else "submitted",
+        "collection_id": collection_id,
+        **package,
+    }
+    if dry_run:
+        result["response"] = None
+        return result
+
+    url, api_key = _smoldata_credentials(api_url, api_key_env, env_file)
+    response = _post_task_archive(
+        url,
+        api_key,
+        collection_id=collection_id,
+        archive_path=Path(package["archive_path"]),
+        task_name=package["task_name"],
+        idempotency_key=f"{package['task_name']}-{package['archive_sha256']}",
+        timeout=timeout,
+    )
+    result["response"] = response
+    return result
+
+
+def package_task_archive(
+    source_dir: Path,
+    *,
+    task_name: str = "",
+    archive_out: Path | None = None,
+) -> dict[str, Any]:
+    source_dir = source_dir.expanduser().resolve()
+    name = task_name or source_dir.name
+    if not _valid_task_name(name):
+        raise SmoldataError(f"invalid task name for archive: {name!r}")
+    if not source_dir.is_dir():
+        raise SmoldataError(f"source task directory does not exist: {source_dir}")
+
+    try:
+        inventory = publisher.task_inventory(source_dir)
+    except publisher.PublishError as exc:
+        raise SmoldataError(str(exc)) from exc
+
+    if archive_out is None:
+        handle = tempfile.NamedTemporaryFile(
+            prefix=f"{name}-",
+            suffix=".tar.gz",
+            delete=False,
+        )
+        archive_path = Path(handle.name)
+        handle.close()
+    else:
+        archive_path = archive_out.expanduser().resolve()
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+
+    _write_deterministic_task_tarball(source_dir, name, inventory, archive_path)
+    return {
+        "task_name": name,
+        "source_dir": str(source_dir),
+        "archive_path": str(archive_path),
+        "archive_sha256": _sha256_file(archive_path),
+        "inventory_sha256": publisher.inventory_sha256(inventory),
+        "file_count": len(inventory),
+    }
+
+
+def _write_deterministic_task_tarball(
+    source_dir: Path,
+    task_name: str,
+    inventory: dict[str, dict[str, Any]],
+    archive_path: Path,
+) -> None:
+    with archive_path.open("wb") as raw:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz:
+            with tarfile.open(fileobj=gz, mode="w") as tar:
+                root = tarfile.TarInfo(task_name)
+                root.type = tarfile.DIRTYPE
+                root.mode = 0o755
+                root.mtime = 0
+                root.uid = root.gid = 0
+                root.uname = root.gname = ""
+                tar.addfile(root)
+                for relative, metadata in sorted(inventory.items()):
+                    path = source_dir / relative
+                    info = tar.gettarinfo(str(path), arcname=f"{task_name}/{relative}")
+                    info.mtime = 0
+                    info.uid = info.gid = 0
+                    info.uname = info.gname = ""
+                    info.mode = 0o755 if metadata["executable"] else 0o644
+                    with path.open("rb") as handle:
+                        tar.addfile(info, handle)
+
+
+def _post_task_archive(
+    api_url: str,
+    api_key: str,
+    *,
+    collection_id: str,
+    archive_path: Path,
+    task_name: str,
+    idempotency_key: str,
+    timeout: int,
+) -> Any:
+    body, content_type = _multipart_body(
+        fields={"collectionId": collection_id},
+        files={
+            "task": (
+                f"{task_name}.tar.gz",
+                "application/gzip",
+                archive_path.read_bytes(),
+            )
+        },
+    )
+    request = urllib.request.Request(
+        f"{api_url.rstrip('/')}/api/v1/tasks",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": content_type,
+            "Idempotency-Key": idempotency_key,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return _decode_api_body(response.read())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise SmoldataError(
+            f"Smoldata collection upload failed ({exc.code}): {detail[-2000:]}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise SmoldataError(f"Smoldata collection upload failed: {exc}") from exc
+
+
+def _multipart_body(
+    *,
+    fields: dict[str, str],
+    files: dict[str, tuple[str, str, bytes]],
+) -> tuple[bytes, str]:
+    boundary = f"----synthtask-{secrets.token_hex(16)}"
+    chunks: list[bytes] = []
+    for name, value in fields.items():
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode("ascii"),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("ascii"),
+                value.encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+    for field, (filename, content_type, payload) in files.items():
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode("ascii"),
+                (
+                    f'Content-Disposition: form-data; name="{field}"; '
+                    f'filename="{filename}"\r\n'
+                ).encode("ascii"),
+                f"Content-Type: {content_type}\r\n\r\n".encode("ascii"),
+                payload,
+                b"\r\n",
+            ]
+        )
+    chunks.append(f"--{boundary}--\r\n".encode("ascii"))
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def _smoldata_credentials(
+    api_url: str,
+    api_key_env: str,
+    env_file: Path | None,
+) -> tuple[str, str]:
+    file_env = _load_env_file(env_file) if env_file else {}
+    url = (
+        api_url
+        or os.environ.get("SMOLDATA_URL", "")
+        or file_env.get("SMOLDATA_URL", "")
+        or DEFAULT_API_URL
+    )
+    api_key = os.environ.get(api_key_env, "") or file_env.get(api_key_env, "")
+    if not api_key:
+        raise SmoldataError(
+            f"missing Smoldata API key; set {api_key_env} or add it to {env_file}"
+        )
+    return url, api_key
+
+
+def _load_env_file(path: Path) -> dict[str, str]:
+    expanded = path.expanduser()
+    if not expanded.exists():
+        return {}
+    values: dict[str, str] = {}
+    for raw in expanded.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("\"'")
+        if key:
+            values[key] = value
+    return values
+
+
+def _decode_api_body(body: bytes) -> Any:
+    text = body.decode("utf-8", errors="replace")
+    if not text.strip():
+        return {}
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {"raw": text}
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _valid_task_name(name: str) -> bool:
+    return bool(name) and "/" not in name and name not in {".", ".."}

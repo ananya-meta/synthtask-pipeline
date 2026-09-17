@@ -256,7 +256,14 @@ synthtask publish run 1 --task-name my-task-name
 synthtask smoldata watch my-task-name --scaffold-run-id 1
 synthtask smoldata review my-task-name --wait --scaffold-run-id 1
 synthtask smoldata rerun my-task-name
+synthtask smoldata submit-collection smol-col-... /path/to/canonical-task-root \
+  --task-name my-task-name --scaffold-run-id 1
 ```
+
+Collection submission uses the contributor API directly. Set `SMOLDATA_API_KEY` and,
+optionally, `SMOLDATA_URL`, or put them in `~/.smoldata-env`. The command packages exactly
+one top-level task directory into a deterministic `.tar.gz`, adds the requested
+`collectionId`, and sends an idempotency key derived from the archive digest.
 
 By default `synthtask publish run` uses `SYNTH_TASK_REMOTE`, or the sibling
 `/data/repos/ananyajain-tbench` remote when present. It publishes through a temporary
